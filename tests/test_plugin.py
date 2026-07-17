@@ -100,7 +100,7 @@ def test_manifest_uses_current_fields():
     assert manifest == {
         "manifest_version": 1,
         "name": LEGACY_PLUGIN_ID,
-        "version": "0.6.0",
+        "version": "0.6.1",
         "description": (
             "Update-persistent Hermes Telegram Business integration with voice and video-note transcription, "
             "conservative transcript cleanup, and Business-scoped replies."
@@ -115,7 +115,7 @@ def test_package_metadata_uses_public_product_identity():
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
     assert metadata["name"] == "hermes-telegram-business"
-    assert metadata["version"] == "0.6.0"
+    assert metadata["version"] == "0.6.1"
     assert metadata["description"] == (
         "Update-persistent Telegram Business integration for Hermes Agent with voice and video-note "
         "transcription and Business-scoped replies."
@@ -204,6 +204,13 @@ def _install_fake_telegram_adapter(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "plugins.platforms", platforms)
     monkeypatch.setitem(sys.modules, "plugins.platforms.telegram", telegram)
     monkeypatch.setitem(sys.modules, "plugins.platforms.telegram.adapter", telegram_adapter)
+
+    gateway = types.ModuleType("gateway")
+    platform_registry_module = types.ModuleType("gateway.platform_registry")
+    platform_registry_module.platform_registry = SimpleNamespace(get=lambda _name: None)
+    gateway.platform_registry = platform_registry_module
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", platform_registry_module)
     return telegram_adapter, handler_calls
 
 
@@ -220,6 +227,45 @@ def test_adapter_compat_adds_video_note_filter_and_is_idempotent(plugin, monkeyp
 
     assert result == (19, callback, (7,), {"block": False})
     assert handler_calls == [result]
+
+
+def test_adapter_compat_patches_registered_isolated_module(plugin, monkeypatch):
+    legacy_adapter, _ = _install_fake_telegram_adapter(monkeypatch)
+
+    class RegisteredAdapter(legacy_adapter.TelegramAdapter):
+        pass
+
+    RegisteredAdapter.__module__ = "hermes_plugins.telegram_platform.adapter"
+    factory_namespace = {"TelegramAdapter": RegisteredAdapter}
+    exec(
+        "def build_adapter(config):\n    return TelegramAdapter(config)",
+        factory_namespace,
+    )
+    build_adapter = factory_namespace["build_adapter"]
+
+    isolated_adapter = types.ModuleType("hermes_plugins.telegram_platform.adapter")
+    isolated_adapter.TelegramAdapter = RegisteredAdapter
+    isolated_adapter.TelegramMessageHandler = legacy_adapter.TelegramMessageHandler
+    isolated_adapter.filters = SimpleNamespace(VIDEO_NOTE=16)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_plugins.telegram_platform.adapter",
+        isolated_adapter,
+    )
+    sys.modules["gateway.platform_registry"].platform_registry = SimpleNamespace(
+        get=lambda name: SimpleNamespace(adapter_factory=build_adapter) if name == "telegram" else None
+    )
+
+    assert plugin._install_telegram_adapter_compat() is True
+
+    assert getattr(RegisteredAdapter._handle_media_message, "_hermes_business_compat", False)
+    assert getattr(RegisteredAdapter._is_user_authorized_from_message, "_hermes_business_compat", False)
+    assert getattr(isolated_adapter.TelegramMessageHandler, "_hermes_business_compat", False)
+    assert not getattr(
+        legacy_adapter.TelegramAdapter._handle_media_message,
+        "_hermes_business_compat",
+        False,
+    )
 
 
 @pytest.mark.asyncio

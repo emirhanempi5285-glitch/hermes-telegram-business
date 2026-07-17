@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1 - 2026-07-18
+
+- Resolve the active Telegram adapter through Hermes's platform registry.
+- Support Hermes 0.18.2's isolated `hermes_plugins.telegram_platform` loader while retaining the legacy import fallback.
+- Test that the shim patches the registered adapter class rather than a duplicate legacy module.
+
 ## 0.6.0 - 2026-07-18
 
 - Move the Telegram Business adapter compatibility into the persistent user plugin.

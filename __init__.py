@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -141,6 +142,33 @@ def _is_business_voice_media(message: Any) -> bool:
     )
 
 
+def _resolve_telegram_adapter_module() -> Any:
+    """Return the module that owns Hermes's registered Telegram adapter.
+
+    Hermes 0.18.2 loads bundled platforms in an isolated
+    ``hermes_plugins.<slug>`` namespace. Older releases used the source-tree
+    ``plugins.platforms`` import path. Resolve through the platform registry
+    first so the shim always patches the class the gateway will instantiate,
+    then retain the legacy import as a compatibility fallback.
+    """
+
+    try:
+        from gateway.platform_registry import platform_registry
+
+        entry = platform_registry.get("telegram")
+        factory_globals = getattr(getattr(entry, "adapter_factory", None), "__globals__", {})
+        adapter_cls = factory_globals.get("TelegramAdapter")
+        adapter_module = sys.modules.get(getattr(adapter_cls, "__module__", ""))
+        if adapter_module is not None:
+            return adapter_module
+    except Exception:
+        logger.debug("%s: registered Telegram adapter resolution failed", _PLUGIN_NAME, exc_info=True)
+
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    return telegram_adapter
+
+
 def _install_telegram_adapter_compat() -> bool:
     """Install the narrow adapter compatibility required by this plugin.
 
@@ -156,7 +184,7 @@ def _install_telegram_adapter_compat() -> bool:
         return True
 
     try:
-        from plugins.platforms.telegram import adapter as telegram_adapter
+        telegram_adapter = _resolve_telegram_adapter_module()
     except Exception as exc:  # noqa: BLE001 - gateway startup must remain available
         logger.warning("%s: Telegram adapter compatibility unavailable: %s", _PLUGIN_NAME, exc)
         return False

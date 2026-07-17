@@ -19,7 +19,7 @@ Duplicate updates are suppressed in memory for 24 hours. The plugin never runs a
 
 ## Roadmap
 
-The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.6.0`.
+The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.6.1`.
 
 ## Requirements
 
