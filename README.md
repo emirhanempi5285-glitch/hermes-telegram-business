@@ -136,7 +136,7 @@ The first response chunk replies to the original message; continuation chunks us
 The unit suite uses fake Telegram objects and fake STT/LLM implementations. It needs no Telegram token, provider credential, network call, or running gateway.
 
 ```bash
-python -m pip install pytest pyyaml
+python -m pip install pytest pytest-asyncio pyyaml
 python -m pytest -q
 ```
 

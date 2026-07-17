@@ -21,7 +21,18 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from hermes_constants import get_hermes_home
+try:
+    from hermes_constants import get_hermes_home
+except ModuleNotFoundError as exc:
+    if exc.name != "hermes_constants":
+        raise
+
+    # Keep source checkouts and credential-free CI importable without installing
+    # all of Hermes. A real Hermes process always supplies hermes_constants.
+    def get_hermes_home() -> Path:
+        configured = os.getenv("HERMES_HOME")
+        return Path(configured).expanduser() if configured else Path.home() / ".hermes"
+
 
 logger = logging.getLogger(__name__)
 
