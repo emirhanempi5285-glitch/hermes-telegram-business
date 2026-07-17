@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - 2026-07-17
+
+### Changed
+
+- Rebranded the public product, repository, and package metadata as **Hermes Telegram Business** / `hermes-telegram-business`.
+- Positioned voice and video-note transcription with Business-scoped replies as the first currently shipped module rather than the product boundary.
+- Updated installation examples, badges, source/homepage links, and release references to the canonical repository URL.
+
+### Compatibility
+
+- Retained `telegram-business-voice-transcriber` as the legacy-stable Hermes runtime plugin ID, including existing config keys, update/remove commands, and cache paths.
+- Retained all existing `TG_BUSINESS_VOICE_*` environment-variable namespaces.
+- Existing installations that use the old GitHub URL continue through GitHub's repository redirect; no reinstall is required.
+
 ## [0.4.1] - 2026-07-17
 
 ### Fixed
@@ -26,5 +40,6 @@ All notable changes to this project are documented here.
 - Delete each transiently downloaded media file after the transcription attempt.
 - Keep cleanup failures fail-safe: the raw transcript is posted rather than dropped.
 
-[0.4.1]: https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/releases/tag/v0.4.1
-[0.4.0]: https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/releases/tag/v0.4.0
+[0.5.0]: https://github.com/neoromantic/hermes-telegram-business/releases/tag/v0.5.0
+[0.4.1]: https://github.com/neoromantic/hermes-telegram-business/releases/tag/v0.4.1
+[0.4.0]: https://github.com/neoromantic/hermes-telegram-business/releases/tag/v0.4.0

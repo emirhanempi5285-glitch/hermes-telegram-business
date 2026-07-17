@@ -1,3 +1,18 @@
+[project]
+name = "hermes-telegram-business"
+version = "0.5.0"
+description = "Telegram Business integration for Hermes Agent; currently ships voice and video-note transcription and Business-scoped replies."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "neoromantic" }]
+
+[project.urls]
+Homepage = "https://github.com/neoromantic/hermes-telegram-business"
+Source = "https://github.com/neoromantic/hermes-telegram-business"
+Issues = "https://github.com/neoromantic/hermes-telegram-business/issues"
+Changelog = "https://github.com/neoromantic/hermes-telegram-business/blob/main/CHANGELOG.md"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

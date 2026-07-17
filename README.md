@@ -1,11 +1,11 @@
-# Telegram Business Voice Transcriber for Hermes Agent
+# Hermes Telegram Business
 
-[![test](https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/actions/workflows/test.yml/badge.svg)](https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/actions/workflows/test.yml)
+[![test](https://github.com/neoromantic/hermes-telegram-business/actions/workflows/test.yml/badge.svg)](https://github.com/neoromantic/hermes-telegram-business/actions/workflows/test.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A focused [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that turns Telegram Business voice messages and round video notes into text without spending a full agent turn.
+An extensible [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration for Telegram Business. Its first and currently shipped module turns voice messages and round video notes into text without spending a full agent turn.
 
-## What it does
+## Current module: voice transcription
 
 1. Intercepts a Telegram `voice` or `video_note` update at `pre_gateway_dispatch`.
 2. Requires a real Telegram Business connection and preserves its `business_connection_id`.
@@ -16,6 +16,10 @@ A focused [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin th
 7. Replies through the same Business connection, splitting long text into Telegram-safe chunks.
 
 Duplicate updates are suppressed in memory for 24 hours. The plugin never runs a separate model provider client and never needs its own credentials.
+
+## Roadmap
+
+The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.5.0`.
 
 ## Requirements
 
@@ -32,10 +36,17 @@ HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH=1
 
 The adapter applies that bypass only when both a real `business_connection_id` and a `voice`/`video_note` payload are present. It does not bypass auth for ordinary messages or other media. The plugin itself intentionally handles every voice/video note delivered through the bot's Business connections; it has no separate sender allowlist.
 
+## Compatibility and identity
+
+- The public product and repository are **Hermes Telegram Business** / `hermes-telegram-business`.
+- The Hermes runtime plugin ID remains `telegram-business-voice-transcriber`. It is a legacy-stable internal ID used by existing install directories, enablement/config keys, update/remove commands, and cache paths.
+- Existing environment-variable namespaces remain unchanged.
+- Existing Git installations that retain the [old repository URL](https://github.com/neoromantic/hermes-telegram-business-voice-transcriber) continue to update through GitHub's redirect. No reinstall or config migration is required for this rebrand.
+
 ## Install
 
 ```bash
-hermes plugins install neoromantic/hermes-telegram-business-voice-transcriber --enable
+hermes plugins install neoromantic/hermes-telegram-business --enable
 hermes gateway restart
 ```
 
@@ -59,7 +70,7 @@ hermes plugins remove telegram-business-voice-transcriber
 hermes gateway restart
 ```
 
-`hermes plugins update` uses the Git remote retained by the installer, so do not copy the directory manually if you want supported updates.
+`hermes plugins update` uses the Git remote retained by the installer. Both the old redirected source URL and the canonical repository URL remain supported; do not copy the directory manually if you want supported updates.
 
 ## Configuration
 
@@ -95,7 +106,7 @@ plugins:
 
 If the trust gate, provider, or model is unavailable, the plugin logs the cleanup failure and posts the raw STT transcript. To use different environment values, update the allowlists to match. To avoid any LLM call, set `TG_BUSINESS_VOICE_CLEANUP_DISABLE=1`.
 
-## Architecture
+## Current module architecture
 
 The plugin registers one `pre_gateway_dispatch` hook. Matching updates are marked as handled immediately and processing continues in an asynchronous task:
 

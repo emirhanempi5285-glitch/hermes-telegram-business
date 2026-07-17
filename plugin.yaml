@@ -1,7 +1,9 @@
 manifest_version: 1
+# Legacy-stable runtime identity: changing this would break existing Hermes
+# install directories, config keys, and update/remove commands.
 name: telegram-business-voice-transcriber
-version: 0.4.1
-description: "Auto-transcribe Telegram Business voice messages and round video notes, optionally apply conservative host-LLM copy editing, and reply without a full agent turn."
+version: 0.5.0
+description: "Hermes Telegram Business integration; currently provides voice and video-note transcription, conservative transcript cleanup, and Business-scoped replies."
 author: neoromantic
 kind: standalone
 provides_hooks:

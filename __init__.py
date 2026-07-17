@@ -1,9 +1,10 @@
-"""Telegram Business voice and round-video-note auto-transcriber.
+"""Hermes Telegram Business — voice and video-note transcription module.
 
-The plugin intercepts Telegram Business voice-like media before the normal
-Hermes auth and agent path, delegates speech recognition to the host's configured
-STT provider, optionally applies conservative LLM copy editing, and posts the
-transcript through the original ``business_connection_id`` without an agent turn.
+This first product module intercepts Telegram Business voice-like media before
+the normal Hermes auth and agent path, delegates speech recognition to the
+host's configured STT provider, optionally applies conservative LLM copy
+editing, and posts the transcript through the original
+``business_connection_id`` without an agent turn.
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ except ModuleNotFoundError as exc:
 
 logger = logging.getLogger(__name__)
 
+# Legacy-stable Hermes runtime ID. Keep aligned with plugin.yaml so existing
+# install directories, config keys, update/remove commands, and cache paths work.
 _PLUGIN_NAME = "telegram-business-voice-transcriber"
 _DISABLE_ENV = "TG_BUSINESS_VOICE_TRANSCRIBER_DISABLE"
 _SEND_ERRORS_ENV = "TG_BUSINESS_VOICE_TRANSCRIBER_SEND_ERRORS"

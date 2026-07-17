@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import tomllib
 import types
 import uuid
 from pathlib import Path
@@ -14,6 +15,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_FILE = ROOT / "__init__.py"
+CANONICAL_REPOSITORY = "https://github.com/neoromantic/hermes-telegram-business"
+LEGACY_PLUGIN_ID = "telegram-business-voice-transcriber"
 
 
 @pytest.fixture
@@ -96,16 +99,62 @@ def test_manifest_uses_current_fields():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
     assert manifest == {
         "manifest_version": 1,
-        "name": "telegram-business-voice-transcriber",
-        "version": "0.4.1",
+        "name": LEGACY_PLUGIN_ID,
+        "version": "0.5.0",
         "description": (
-            "Auto-transcribe Telegram Business voice messages and round video notes, "
-            "optionally apply conservative host-LLM copy editing, and reply without a full agent turn."
+            "Hermes Telegram Business integration; currently provides voice and video-note transcription, "
+            "conservative transcript cleanup, and Business-scoped replies."
         ),
         "author": "neoromantic",
         "kind": "standalone",
         "provides_hooks": ["pre_gateway_dispatch"],
     }
+
+
+def test_package_metadata_uses_public_product_identity():
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    assert metadata["name"] == "hermes-telegram-business"
+    assert metadata["version"] == "0.5.0"
+    assert metadata["description"] == (
+        "Telegram Business integration for Hermes Agent; currently ships voice and video-note transcription "
+        "and Business-scoped replies."
+    )
+    assert metadata["urls"] == {
+        "Homepage": CANONICAL_REPOSITORY,
+        "Source": CANONICAL_REPOSITORY,
+        "Issues": f"{CANONICAL_REPOSITORY}/issues",
+        "Changelog": f"{CANONICAL_REPOSITORY}/blob/main/CHANGELOG.md",
+    }
+
+
+def test_readme_uses_public_name_and_canonical_install_source():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert readme.startswith("# Hermes Telegram Business\n")
+    assert f"{CANONICAL_REPOSITORY}/actions/workflows/test.yml" in readme
+    assert "hermes plugins install neoromantic/hermes-telegram-business --enable" in readme
+    assert "legacy-stable" in readme
+    assert "not implemented" in readme
+
+
+def test_ci_runs_on_main_and_version_tags():
+    workflow = yaml.load(
+        (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+
+    assert workflow["on"]["push"] == {
+        "branches": ["main"],
+        "tags": ["v*"],
+    }
+    assert "pull_request" in workflow["on"]
+
+
+def test_runtime_identity_and_configuration_namespace_remain_legacy_stable(plugin):
+    assert plugin._PLUGIN_NAME == LEGACY_PLUGIN_ID
+    assert plugin._DISABLE_ENV == "TG_BUSINESS_VOICE_TRANSCRIBER_DISABLE"
+    assert plugin._SEND_ERRORS_ENV == "TG_BUSINESS_VOICE_TRANSCRIBER_SEND_ERRORS"
 
 
 def test_registers_only_pre_gateway_dispatch_hook(plugin):
