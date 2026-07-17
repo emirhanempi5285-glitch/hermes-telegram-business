@@ -1,7 +1,7 @@
 [project]
 name = "hermes-telegram-business"
-version = "0.5.0"
-description = "Telegram Business integration for Hermes Agent; currently ships voice and video-note transcription and Business-scoped replies."
+version = "0.6.0"
+description = "Update-persistent Telegram Business integration for Hermes Agent with voice and video-note transcription and Business-scoped replies."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

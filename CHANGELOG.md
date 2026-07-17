@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 - 2026-07-18
+
+- Move the Telegram Business adapter compatibility into the persistent user plugin.
+- Handle Business updates exposed through `effective_message` without mutating PTB update objects.
+- Register round video notes with Hermes's media handler.
+- Keep the auth exception opt-in and limited to real Business voice/video-note media.
+- Remove the need to patch Hermes core during or after normal updates.
+
 All notable changes to this project are documented here.
 
 ## [0.5.0] - 2026-07-17

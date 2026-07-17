@@ -48,6 +48,7 @@ _CLEANUP_MODEL_ENV = "TG_BUSINESS_VOICE_CLEANUP_MODEL"
 _CLEANUP_TIMEOUT_ENV = "TG_BUSINESS_VOICE_CLEANUP_TIMEOUT"
 _CLEANUP_MIN_CHARS_ENV = "TG_BUSINESS_VOICE_CLEANUP_MIN_CHARS"
 _CLEANUP_MIN_WORDS_ENV = "TG_BUSINESS_VOICE_CLEANUP_MIN_WORDS"
+_ADAPTER_AUTH_BYPASS_ENV = "HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH"
 
 _DEFAULT_CLEANUP_PROVIDER = "gemini"
 _DEFAULT_CLEANUP_MODEL = "gemini-3.5-flash"
@@ -60,6 +61,7 @@ _SEEN_TTL_SECONDS = 24 * 60 * 60
 _seen_lock = threading.Lock()
 _seen_messages: dict[tuple[str, str, str], float] = {}
 _llm_facade: Any = None
+_adapter_compat_installed = False
 
 _CLEANUP_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -108,6 +110,105 @@ Hard rules:
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _UpdateMessageProxy:
+    """Expose a Business update's effective message as ``update.message``.
+
+    python-telegram-bot's Update objects are immutable enough that mutating the
+    original object is not a reliable compatibility strategy. Hermes's media
+    handler only needs the ordinary update interface, so a tiny forwarding
+    proxy keeps this shim local and preserves every other update attribute.
+    """
+
+    def __init__(self, update: Any, message: Any) -> None:
+        self._update = update
+        self.message = message
+        self.effective_message = message
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._update, name)
+
+
+def _is_business_voice_media(message: Any) -> bool:
+    return bool(
+        message is not None
+        and _business_connection_id(message)
+        and (
+            getattr(message, "voice", None) is not None
+            or getattr(message, "video_note", None) is not None
+        )
+    )
+
+
+def _install_telegram_adapter_compat() -> bool:
+    """Install the narrow adapter compatibility required by this plugin.
+
+    Hermes user plugins live outside the core checkout and survive normal
+    updates. Keeping the compatibility layer here avoids a dirty Hermes tree
+    while retaining three required behaviors: Business ``effective_message``
+    delivery, round-video handler registration, and the opt-in auth exception
+    for Business voice-like media only.
+    """
+
+    global _adapter_compat_installed
+    if _adapter_compat_installed:
+        return True
+
+    try:
+        from plugins.platforms.telegram import adapter as telegram_adapter
+    except Exception as exc:  # noqa: BLE001 - gateway startup must remain available
+        logger.warning("%s: Telegram adapter compatibility unavailable: %s", _PLUGIN_NAME, exc)
+        return False
+
+    adapter_cls = telegram_adapter.TelegramAdapter
+
+    original_auth = adapter_cls._is_user_authorized_from_message
+    if not getattr(original_auth, "_hermes_business_compat", False):
+
+        def _compat_authorized(self: Any, message: Any) -> bool:
+            if original_auth(self, message):
+                return True
+            return bool(
+                _truthy_env(_ADAPTER_AUTH_BYPASS_ENV)
+                and _is_business_voice_media(message)
+            )
+
+        _compat_authorized._hermes_business_compat = True  # type: ignore[attr-defined]
+        adapter_cls._is_user_authorized_from_message = _compat_authorized
+
+    original_media = adapter_cls._handle_media_message
+    if not getattr(original_media, "_hermes_business_compat", False):
+
+        async def _compat_media(self: Any, update: Any, context: Any) -> Any:
+            message = (
+                getattr(update, "effective_message", None)
+                or getattr(update, "business_message", None)
+                or getattr(update, "message", None)
+            )
+            if message is not None and getattr(update, "message", None) is None:
+                update = _UpdateMessageProxy(update, message)
+            return await original_media(self, update, context)
+
+        _compat_media._hermes_business_compat = True  # type: ignore[attr-defined]
+        adapter_cls._handle_media_message = _compat_media
+
+    original_handler = telegram_adapter.TelegramMessageHandler
+    if not getattr(original_handler, "_hermes_business_compat", False):
+
+        def _compat_message_handler(handler_filter: Any, callback: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(callback, "__name__", "") == "_handle_media_message":
+                video_note_filter = getattr(telegram_adapter.filters, "VIDEO_NOTE", None)
+                if video_note_filter is not None:
+                    handler_filter = handler_filter | video_note_filter
+            return original_handler(handler_filter, callback, *args, **kwargs)
+
+        _compat_message_handler._hermes_business_compat = True  # type: ignore[attr-defined]
+        telegram_adapter.TelegramMessageHandler = _compat_message_handler
+
+    _adapter_compat_installed = True
+    logger.info("%s: installed update-persistent Telegram Business adapter compatibility", _PLUGIN_NAME)
+    return True
 
 
 def _get(obj: Any, name: str, default: Any = None) -> Any:
@@ -637,4 +738,5 @@ def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -
 def register(ctx: Any) -> None:
     global _llm_facade
     _llm_facade = getattr(ctx, "llm", None)
+    _install_telegram_adapter_compat()
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)

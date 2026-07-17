@@ -19,7 +19,7 @@ Duplicate updates are suppressed in memory for 24 hours. The plugin never runs a
 
 ## Roadmap
 
-The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.5.0`.
+The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.6.0`.
 
 ## Requirements
 
@@ -28,13 +28,15 @@ The broader product direction includes message/media routing, operator or CRM in
 - A configured Telegram gateway with a Telegram Business connection.
 - A working Hermes STT provider. Configure it with `hermes setup` or the [`stt` settings](https://hermes-agent.nousresearch.com/docs/user-guide/configuration).
 
-Telegram Business voice/video notes can originate from users outside the ordinary DM allowlist. Current Hermes Telegram adapters require the narrowly scoped adapter bypass below for those updates to reach this plugin:
+Telegram Business voice/video notes can originate from users outside the ordinary DM allowlist. Enable the plugin's narrowly scoped adapter bypass so those updates can reach its hook:
 
 ```bash
 HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH=1
 ```
 
-The adapter applies that bypass only when both a real `business_connection_id` and a `voice`/`video_note` payload are present. It does not bypass auth for ordinary messages or other media. The plugin itself intentionally handles every voice/video note delivered through the bot's Business connections; it has no separate sender allowlist.
+At registration time the plugin installs a small, idempotent compatibility shim around Hermes's bundled Telegram adapter. It recognizes Business `effective_message` updates, registers round video notes with the media handler, and applies the bypass only when both a real `business_connection_id` and a `voice`/`video_note` payload are present. It does not bypass auth for ordinary messages or other media. Because the shim belongs to this profile-scoped user plugin rather than the Hermes checkout, a normal `hermes update` neither removes it nor creates a core patch conflict.
+
+The plugin itself intentionally handles every voice/video note delivered through the bot's Business connections; it has no separate sender allowlist.
 
 ## Compatibility and identity
 
@@ -70,7 +72,7 @@ hermes plugins remove telegram-business-voice-transcriber
 hermes gateway restart
 ```
 
-`hermes plugins update` uses the Git remote retained by the installer. Both the old redirected source URL and the canonical repository URL remain supported; do not copy the directory manually if you want supported updates.
+`hermes plugins update` uses the Git remote retained by the installer. Both the old redirected source URL and the canonical repository URL remain supported; do not copy the directory manually if you want supported updates. Hermes core updates and this plugin's updates are independent: the installed plugin persists across a core update, while the command above advances the plugin itself.
 
 ## Configuration
 

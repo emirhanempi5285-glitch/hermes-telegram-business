@@ -100,9 +100,9 @@ def test_manifest_uses_current_fields():
     assert manifest == {
         "manifest_version": 1,
         "name": LEGACY_PLUGIN_ID,
-        "version": "0.5.0",
+        "version": "0.6.0",
         "description": (
-            "Hermes Telegram Business integration; currently provides voice and video-note transcription, "
+            "Update-persistent Hermes Telegram Business integration with voice and video-note transcription, "
             "conservative transcript cleanup, and Business-scoped replies."
         ),
         "author": "neoromantic",
@@ -115,10 +115,10 @@ def test_package_metadata_uses_public_product_identity():
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
     assert metadata["name"] == "hermes-telegram-business"
-    assert metadata["version"] == "0.5.0"
+    assert metadata["version"] == "0.6.0"
     assert metadata["description"] == (
-        "Telegram Business integration for Hermes Agent; currently ships voice and video-note transcription "
-        "and Business-scoped replies."
+        "Update-persistent Telegram Business integration for Hermes Agent with voice and video-note "
+        "transcription and Business-scoped replies."
     )
     assert metadata["urls"] == {
         "Homepage": CANONICAL_REPOSITORY,
@@ -169,6 +169,95 @@ def test_registers_only_pre_gateway_dispatch_hook(plugin):
 
     assert plugin._llm_facade is llm
     assert registrations == [("pre_gateway_dispatch", plugin._on_pre_gateway_dispatch)]
+
+
+def _install_fake_telegram_adapter(monkeypatch: pytest.MonkeyPatch):
+    class FakeAdapter:
+        def _is_user_authorized_from_message(self, _message):
+            return False
+
+        async def _handle_media_message(self, update, _context):
+            self.handled_message = update.message
+            self.handled_update_id = update.update_id
+            return "handled"
+
+    handler_calls = []
+
+    def message_handler(handler_filter, callback, *args, **kwargs):
+        call = (handler_filter, callback, args, kwargs)
+        handler_calls.append(call)
+        return call
+
+    telegram_adapter = types.ModuleType("plugins.platforms.telegram.adapter")
+    telegram_adapter.TelegramAdapter = FakeAdapter
+    telegram_adapter.TelegramMessageHandler = message_handler
+    telegram_adapter.filters = SimpleNamespace(VIDEO_NOTE=16)
+
+    plugins = types.ModuleType("plugins")
+    platforms = types.ModuleType("plugins.platforms")
+    telegram = types.ModuleType("plugins.platforms.telegram")
+    telegram.adapter = telegram_adapter
+    plugins.platforms = platforms
+    platforms.telegram = telegram
+
+    monkeypatch.setitem(sys.modules, "plugins", plugins)
+    monkeypatch.setitem(sys.modules, "plugins.platforms", platforms)
+    monkeypatch.setitem(sys.modules, "plugins.platforms.telegram", telegram)
+    monkeypatch.setitem(sys.modules, "plugins.platforms.telegram.adapter", telegram_adapter)
+    return telegram_adapter, handler_calls
+
+
+def test_adapter_compat_adds_video_note_filter_and_is_idempotent(plugin, monkeypatch):
+    telegram_adapter, handler_calls = _install_fake_telegram_adapter(monkeypatch)
+
+    assert plugin._install_telegram_adapter_compat() is True
+    first_handler = telegram_adapter.TelegramMessageHandler
+    assert plugin._install_telegram_adapter_compat() is True
+    assert telegram_adapter.TelegramMessageHandler is first_handler
+
+    callback = SimpleNamespace(__name__="_handle_media_message")
+    result = telegram_adapter.TelegramMessageHandler(3, callback, 7, block=False)
+
+    assert result == (19, callback, (7,), {"block": False})
+    assert handler_calls == [result]
+
+
+@pytest.mark.asyncio
+async def test_adapter_compat_exposes_effective_business_message(plugin, monkeypatch):
+    telegram_adapter, _ = _install_fake_telegram_adapter(monkeypatch)
+    plugin._install_telegram_adapter_compat()
+    adapter = telegram_adapter.TelegramAdapter()
+    message = make_message()
+    update = SimpleNamespace(
+        update_id=42,
+        message=None,
+        effective_message=message,
+        business_message=message,
+    )
+
+    result = await adapter._handle_media_message(update, SimpleNamespace())
+
+    assert result == "handled"
+    assert adapter.handled_message is message
+    assert adapter.handled_update_id == 42
+
+
+def test_adapter_auth_bypass_is_opt_in_and_voice_only(plugin, monkeypatch):
+    telegram_adapter, _ = _install_fake_telegram_adapter(monkeypatch)
+    plugin._install_telegram_adapter_compat()
+    adapter = telegram_adapter.TelegramAdapter()
+    voice = make_message(media_kind="voice")
+    document = make_message(media_kind="voice")
+    document.voice = None
+    document.document = object()
+
+    monkeypatch.delenv("HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH", raising=False)
+    assert adapter._is_user_authorized_from_message(voice) is False
+
+    monkeypatch.setenv("HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH", "1")
+    assert adapter._is_user_authorized_from_message(voice) is True
+    assert adapter._is_user_authorized_from_message(document) is False
+    assert adapter._is_user_authorized_from_message(make_message(business_id=None)) is False
 
 
 @pytest.mark.parametrize(
