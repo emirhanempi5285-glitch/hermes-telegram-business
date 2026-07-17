@@ -97,7 +97,7 @@ def test_manifest_uses_current_fields():
     assert manifest == {
         "manifest_version": 1,
         "name": "telegram-business-voice-transcriber",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "description": (
             "Auto-transcribe Telegram Business voice messages and round video notes, "
             "optionally apply conservative host-LLM copy editing, and reply without a full agent turn."

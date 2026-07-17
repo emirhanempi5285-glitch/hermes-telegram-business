@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1] - 2026-07-17
+
+### Fixed
+
+- Made standalone source imports and credential-free tests portable outside a full Hermes installation.
+- Added the missing `pytest-asyncio` CI dependency so async tests run across supported Python versions.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
@@ -19,4 +26,5 @@ All notable changes to this project are documented here.
 - Delete each transiently downloaded media file after the transcription attempt.
 - Keep cleanup failures fail-safe: the raw transcript is posted rather than dropped.
 
+[0.4.1]: https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/releases/tag/v0.4.1
 [0.4.0]: https://github.com/neoromantic/hermes-telegram-business-voice-transcriber/releases/tag/v0.4.0
