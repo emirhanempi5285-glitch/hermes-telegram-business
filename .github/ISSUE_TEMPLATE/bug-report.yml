@@ -1,0 +1,131 @@
+name: Bug report
+description: Report a reproducible Hermes Telegram Business plugin issue using sanitized details.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Use synthetic or redacted details only. Do not paste private Telegram content, credentials, provider logs, audio, video, or full environment dumps.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy and redaction
+      description: Confirm the report is safe for a public issue.
+      options:
+        - label: I removed bot tokens, API keys, credentials, cookies, and session strings.
+          required: true
+        - label: I removed Telegram Business connection IDs, chat IDs, user IDs, message IDs, update IDs, and relationship IDs.
+          required: true
+        - label: I removed transcript text, message bodies, captions, prompts, audio, video, and screenshots of real conversations.
+          required: true
+        - label: I removed STT/LLM provider logs, gateway logs containing private data, cache files, and full environment dumps.
+          required: true
+  - type: input
+    id: hermes_version
+    attributes:
+      label: Hermes version
+      description: Use the exact installed Hermes version or commit, if known.
+      placeholder: "example: 0.x.y or commit abc1234"
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      description: Use the installed plugin version.
+      placeholder: "example: 0.6.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install_mode
+    attributes:
+      label: Install mode
+      options:
+        - "Hermes plugin install from neoromantic/hermes-telegram-business"
+        - "Existing install updated from legacy redirected repository URL"
+        - "Local development checkout"
+        - "Unknown"
+    validations:
+      required: true
+  - type: dropdown
+    id: event_direction
+    attributes:
+      label: Event direction
+      options:
+        - "Incoming Business voice/video note"
+        - "Outgoing Business voice/video note"
+        - "Unknown direction"
+    validations:
+      required: true
+  - type: dropdown
+    id: media_event_type
+    attributes:
+      label: Media/event type
+      options:
+        - "voice"
+        - "video_note"
+        - "edited voice"
+        - "edited video_note"
+        - "other / unsure"
+    validations:
+      required: true
+  - type: dropdown
+    id: cleanup_mode
+    attributes:
+      label: Transcript cleanup mode
+      options:
+        - "Enabled"
+        - "Disabled with TG_BUSINESS_VOICE_CLEANUP_DISABLE=1"
+        - "Configured but falling back to raw transcript"
+        - "Unknown"
+    validations:
+      required: true
+  - type: dropdown
+    id: stt_mode
+    attributes:
+      label: STT mode
+      description: The plugin uses the Hermes-configured STT backend; do not name credentials or paste provider logs.
+      options:
+        - "Local Hermes-configured STT"
+        - "External Hermes-configured STT"
+        - "Unknown"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproducible steps
+      description: Use sanitized, synthetic identifiers and describe only the minimum sequence needed.
+      placeholder: |
+        1. Configure a Telegram gateway with a Business connection.
+        2. Enable HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH=1.
+        3. Send a synthetic voice/video note through the Business connection.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "example: outgoing short voice note caption is edited with a transcript using the same Business connection"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "example: caption edit failed and no separate sanitized fallback reply was sent"
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized_context
+    attributes:
+      label: Minimal sanitized logs or environment details
+      description: Optional. Include only short redacted snippets that help reproduce the issue. Do not paste provider logs, private message content, IDs, tokens, audio, video, or full environment dumps.
+      placeholder: |
+        Python: 3.11
+        Gateway: Telegram Business enabled
+        Env flags: HERMES_TELEGRAM_BUSINESS_VOICE_BYPASS_AUTH=1, TG_BUSINESS_VOICE_CLEANUP_DISABLE=1
+        Sanitized log excerpt: media_type=voice direction=outgoing chars=42 error=<redacted class only>
+    validations:
+      required: false
