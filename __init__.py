@@ -56,7 +56,9 @@ _DEFAULT_CLEANUP_MODEL = "gemini-3.5-flash"
 _DEFAULT_CLEANUP_TIMEOUT_SECONDS = 45.0
 _DEFAULT_CLEANUP_MIN_CHARS = 81
 _DEFAULT_CLEANUP_MIN_WORDS = 1
+_MAX_CAPTION_CHARS = 1024
 _MAX_CHUNK_CHARS = 3800
+_BUSINESS_EDIT_WINDOW_SECONDS = 48 * 60 * 60
 _SEEN_TTL_SECONDS = 24 * 60 * 60
 
 _seen_lock = threading.Lock()
@@ -466,6 +468,91 @@ def _format_transcript_messages(transcript: str) -> list[str]:
     return messages
 
 
+def _telegram_text_length(text: str) -> int:
+    """Return Telegram's UTF-16 code-unit length for a text field."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _build_transcript_caption(message: Any, transcript: str) -> Optional[str]:
+    """Build a plain short-transcript caption without truncating either text."""
+    transcript = (transcript or "").strip()
+    if not transcript:
+        return None
+    transcript_block = f"🎙️ {transcript}"
+    existing_caption = _get(message, "caption")
+    caption = f"{existing_caption}\n\n{transcript_block}" if existing_caption else transcript_block
+    if _telegram_text_length(caption) > _MAX_CAPTION_CHARS:
+        return None
+    return caption
+
+
+def _within_business_edit_window(message: Any, *, now: Optional[datetime] = None) -> bool:
+    """Fail fast for manual Business messages Telegram will no longer edit."""
+    message_date = _get(message, "date")
+    if not isinstance(message_date, datetime):
+        return True
+    if message_date.tzinfo is None:
+        message_date = message_date.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current - message_date).total_seconds() <= _BUSINESS_EDIT_WINDOW_SECONDS
+
+
+async def _is_outgoing_business_message(*, bot: Any, message: Any) -> bool:
+    """Identify messages sent by the connected Business owner or their bot."""
+    if _get(message, "sender_business_bot") is not None:
+        return True
+
+    business_connection_id = _business_connection_id(message)
+    from_user = _get(message, "from_user")
+    from_user_id = _get(from_user, "id")
+    get_connection = getattr(bot, "get_business_connection", None)
+    if not business_connection_id or from_user_id is None or not callable(get_connection):
+        return False
+
+    try:
+        connection = await _maybe_await(get_connection(business_connection_id))
+    except Exception as exc:  # noqa: BLE001 - direction uncertainty must use the safe reply path
+        logger.debug("%s: Business owner lookup failed; using transcript reply: %s", _PLUGIN_NAME, exc)
+        return False
+    owner_id = _get(_get(connection, "user"), "id")
+    return owner_id is not None and str(owner_id) == str(from_user_id)
+
+
+async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: str) -> bool:
+    """Attach a fitting outgoing transcript, returning False for safe reply fallback."""
+    caption = _build_transcript_caption(message, transcript)
+    if caption is None or not _within_business_edit_window(message):
+        return False
+    if not await _is_outgoing_business_message(bot=bot, message=message):
+        return False
+
+    chat_id = _get(_get(message, "chat"), "id")
+    message_id = _get(message, "message_id")
+    business_connection_id = _business_connection_id(message)
+    if chat_id is None or message_id is None or not business_connection_id:
+        return False
+
+    kwargs = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "caption": caption,
+        "business_connection_id": business_connection_id,
+    }
+    caption_entities = _get(message, "caption_entities")
+    if caption_entities:
+        # Existing entity offsets remain valid because the old caption is kept
+        # byte-for-byte at the start and the transcript is appended as plain text.
+        kwargs["caption_entities"] = caption_entities
+    try:
+        result = await bot.edit_message_caption(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - Telegram edit failures must preserve delivery
+        logger.info("%s: caption edit unavailable; using transcript reply: %s", _PLUGIN_NAME, exc)
+        return False
+    return result is not False
+
+
 def _sanitize_llm_text(text: str) -> str:
     text = (text or "").strip()
     if text.startswith("```") and text.endswith("```"):
@@ -711,10 +798,12 @@ async def _process_business_voice_event(
             return
 
         final_text = await _cleanup_transcript(transcript, llm=llm, cleanup_fn=cleanup_fn)
-        texts = _format_transcript_messages(final_text)
-        await _send_transcript_messages(bot=bot, adapter=adapter, message=message, texts=texts)
+        captioned = await _try_attach_transcript_caption(bot=bot, message=message, transcript=final_text)
+        if not captioned:
+            texts = _format_transcript_messages(final_text)
+            await _send_transcript_messages(bot=bot, adapter=adapter, message=message, texts=texts)
         logger.info(
-            "%s: transcribed business %s chat=%s message=%s raw_chars=%d final_chars=%d cleaned=%s",
+            "%s: transcribed business %s chat=%s message=%s raw_chars=%d final_chars=%d cleaned=%s captioned=%s",
             _PLUGIN_NAME,
             media_label,
             _safe_part(getattr(getattr(message, "chat", None), "id", "")),
@@ -722,6 +811,7 @@ async def _process_business_voice_event(
             len(transcript),
             len(final_text),
             final_text != transcript,
+            captioned,
         )
     except Exception as exc:  # noqa: BLE001 - hook task must never kill gateway
         logger.warning("%s: business voice handling failed: %s", _PLUGIN_NAME, exc, exc_info=True)

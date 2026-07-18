@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Attach fitting transcripts to outgoing Business voice/video-note captions without a duplicate reply.
+- Preserve existing caption text and entities, and fall back to Business-scoped replies for incoming, long, expired, uncertain, or uneditable messages.
+
 ## 0.6.1 - 2026-07-18
 
 - Resolve the active Telegram adapter through Hermes's platform registry.

@@ -13,9 +13,10 @@ An extensible [Hermes Agent](https://github.com/NousResearch/hermes-agent) integ
 4. Downloads the media transiently and delegates speech recognition to Hermes's configured `transcribe_audio` backend.
 5. Optionally asks the host-owned `ctx.llm` facade to correct punctuation, capitalization, paragraphing, and obvious ASR errors.
 6. Rejects lossy cleanup or model failure and falls back to the raw transcript.
-7. Replies through the same Business connection, splitting long text into Telegram-safe chunks.
+7. For a short outgoing Business message, appends the transcript to the original voice/video-note caption.
+8. Uses the existing Business-scoped reply path for incoming, long, expired, or uneditable messages.
 
-Duplicate updates are suppressed in memory for 24 hours. The plugin never runs a separate model provider client and never needs its own credentials.
+Duplicate updates are suppressed in memory for 24 hours. A successful caption edit suppresses the separate transcript reply, so the chat never receives both forms. The plugin never runs a separate model provider client and never needs its own credentials.
 
 ## Roadmap
 
@@ -120,10 +121,13 @@ Telegram Business voice/video note
   -> Hermes transcribe_audio (configured host STT)
   -> optional ctx.llm structured cleanup
   -> lexical conservatism guard / raw fallback
-  -> Telegram send_message(..., business_connection_id=...)
+  -> short outgoing message: edit_message_caption(..., business_connection_id=...)
+  -> otherwise: send_message(..., business_connection_id=...)
 ```
 
-The first response chunk replies to the original message; continuation chunks use the same Business connection.
+Outgoing direction is checked against the owner returned by Telegram's `getBusinessConnection`; `sender_business_bot` is also accepted as an explicit outgoing signal. Caption text is plain text and limited conservatively to Telegram's 1024 UTF-16 code-unit ceiling. An existing caption is retained unchanged at the start, including its entities, then separated from the transcript by a blank line.
+
+Incoming messages, transcripts that do not fit in one caption, messages outside Telegram's 48-hour Business edit window, uncertain direction, and any caption-edit API failure use the existing reply path. The first response chunk replies to the original message; continuation chunks use the same Business connection.
 
 ## Privacy and security
 
@@ -142,6 +146,8 @@ The first response chunk replies to the original message; continuation chunks us
 - STT failure sends nothing unless error replies are enabled.
 - Empty STT output sends nothing.
 - Cleanup timeout, trust denial, malformed output, excessive deletion/addition, or broad paraphrasing falls back to raw STT text.
+- Caption direction checks, length checks, edit-window checks, and API failures fall back to a separate transcript reply.
+- A successful caption edit never also sends a transcript reply.
 - Hook-task exceptions are contained and cannot crash the gateway.
 
 ## Testing
