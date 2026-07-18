@@ -954,11 +954,16 @@ async def test_over_caption_limit_transcript_skips_direction_lookup_and_uses_rep
 
 
 @pytest.mark.asyncio
-async def test_unsupported_expandable_entities_fall_back_to_one_plain_reply(
+async def test_unsupported_expandable_caption_retries_plain_caption_without_reply(
     plugin, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
-    message = make_message(from_user_id=1000)
+    existing_entity = SimpleNamespace(type="bold", offset=0, length=8)
+    message = make_message(
+        from_user_id=1000,
+        caption="Existing",
+        caption_entities=(existing_entity,),
+    )
     event = make_event(message)
     bot = FakeBot(business_owner_id=1000)
     bot.expandable_entities_unsupported = True
@@ -970,7 +975,55 @@ async def test_unsupported_expandable_entities_fall_back_to_one_plain_reply(
         transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
     )
 
-    assert len(bot.edit_calls) == 1
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption"] == "Existing\n\n🎙️ Fallback transcript"
+    assert bot.edit_calls[1]["caption_entities"] == (existing_entity,)
+    assert bot.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expandable_reply_retries_plain_once(plugin, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message()
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert bot.edit_calls == []
+    assert len(bot.calls) == 2
+    assert _has_expandable_entity(bot.calls[0]["entities"])
+    assert "entities" not in bot.calls[1]
+    assert bot.delivered_calls == [bot.calls[1]]
+    assert bot.calls[1]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_failed_plain_caption_retry_uses_complete_plain_reply(plugin, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    bot.edit_result = False
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption_entities"] == ()
     assert len(bot.calls) == 2
     assert _has_expandable_entity(bot.calls[0]["entities"])
     assert "entities" not in bot.calls[1]

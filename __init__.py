@@ -875,8 +875,24 @@ async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: 
     try:
         result = await bot.edit_message_caption(**kwargs)
     except Exception as exc:  # noqa: BLE001 - Telegram edit failures must preserve delivery
-        logger.info("%s: caption edit unavailable; using transcript reply: %s", _PLUGIN_NAME, exc)
-        return False
+        if not _expandable_entity_unsupported(exc):
+            logger.info("%s: caption edit unavailable; using transcript reply: %s", _PLUGIN_NAME, exc)
+            return False
+
+        logger.info("%s: expandable caption unavailable; retrying plain caption: %s", _PLUGIN_NAME, exc)
+        plain_kwargs = {
+            **kwargs,
+            "caption_entities": tuple(_get(message, "caption_entities") or ()),
+        }
+        try:
+            result = await bot.edit_message_caption(**plain_kwargs)
+        except Exception as fallback_exc:  # noqa: BLE001 - reply path preserves transcript delivery
+            logger.info(
+                "%s: plain caption retry unavailable; using transcript reply: %s",
+                _PLUGIN_NAME,
+                fallback_exc,
+            )
+            return False
     return result is not False
 
 
