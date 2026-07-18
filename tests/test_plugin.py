@@ -68,11 +68,14 @@ class FakeBot:
         self.edit_error: Exception | None = None
         self.edit_result = True
         self.expandable_entities_unsupported = False
+        self.send_error: Exception | None = None
 
     async def send_message(self, **kwargs):
         self.calls.append(kwargs)
         if self.expandable_entities_unsupported and _has_expandable_entity(kwargs.get("entities", ())):
             raise RuntimeError("unsupported message entity type: expandable_blockquote")
+        if self.send_error is not None:
+            raise self.send_error
         self.delivered_calls.append(kwargs)
 
     async def get_business_connection(self, business_connection_id: str):
@@ -614,6 +617,46 @@ async def test_unsupported_expandable_entities_fall_back_to_one_plain_reply(
     assert "entities" not in bot.calls[1]
     assert bot.delivered_calls == [bot.calls[1]]
     assert bot.calls[1]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expandable_entities_preserve_every_long_transcript_chunk(plugin):
+    transcript = "🙂" * 5000
+    texts = plugin._format_transcript_messages(transcript)
+    bot = FakeBot()
+    bot.expandable_entities_unsupported = True
+
+    await plugin._send_transcript_messages(
+        bot=bot,
+        adapter=FakeAdapter(bot),
+        message=make_message(),
+        texts=texts,
+    )
+
+    assert len(bot.calls) == len(texts) * 2
+    assert bot.delivered_calls == bot.calls[1::2]
+    assert all("entities" not in call for call in bot.delivered_calls)
+    assert bot.delivered_calls[0]["reply_to_message_id"] == 77
+    assert all("reply_to_message_id" not in call for call in bot.delivered_calls[1:])
+    assert "".join(call["text"].removeprefix("🎙️ ") for call in bot.delivered_calls) == transcript
+
+
+@pytest.mark.asyncio
+async def test_unrelated_entity_send_error_is_not_retried_as_plain_text(plugin):
+    bot = FakeBot()
+    bot.send_error = RuntimeError("Bad Request: can't parse entities: malformed offset")
+
+    with pytest.raises(RuntimeError, match="malformed offset"):
+        await plugin._send_transcript_messages(
+            bot=bot,
+            adapter=FakeAdapter(bot),
+            message=make_message(),
+            texts=["🎙️ Transcript"],
+        )
+
+    assert len(bot.calls) == 1
+    assert _has_expandable_entity(bot.calls[0]["entities"])
+    assert bot.delivered_calls == []
 
 
 @pytest.mark.asyncio

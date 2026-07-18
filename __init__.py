@@ -748,10 +748,9 @@ def _get_adapter_and_bot(event: Any, gateway: Any) -> tuple[Any, Any]:
 def _expandable_entity_unsupported(exc: Exception) -> bool:
     """Identify entity-capability failures that are safe to retry as plain text."""
     detail = str(exc).casefold().replace("’", "'")
-    return (
-        "expandable_blockquote" in detail
-        and any(marker in detail for marker in ("unsupported", "unknown", "invalid", "entity type"))
-    ) or "can't parse entities" in detail
+    return "expandable_blockquote" in detail and any(
+        marker in detail for marker in ("unsupported", "not supported", "unknown", "entity type")
+    )
 
 
 async def _send_transcript_messages(
