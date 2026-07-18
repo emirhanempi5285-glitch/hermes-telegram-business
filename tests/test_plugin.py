@@ -6,6 +6,7 @@ import sys
 import tomllib
 import types
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -57,11 +58,28 @@ class FakeMedia:
 
 
 class FakeBot:
-    def __init__(self):
+    def __init__(self, *, business_owner_id: int = 1000):
         self.calls: list[dict] = []
+        self.edit_calls: list[dict] = []
+        self.business_connection_calls: list[str] = []
+        self.business_owner_id = business_owner_id
+        self.business_connection_error: Exception | None = None
+        self.edit_error: Exception | None = None
 
     async def send_message(self, **kwargs):
         self.calls.append(kwargs)
+
+    async def get_business_connection(self, business_connection_id: str):
+        self.business_connection_calls.append(business_connection_id)
+        if self.business_connection_error is not None:
+            raise self.business_connection_error
+        return SimpleNamespace(user=SimpleNamespace(id=self.business_owner_id))
+
+    async def edit_message_caption(self, **kwargs):
+        self.edit_calls.append(kwargs)
+        if self.edit_error is not None:
+            raise self.edit_error
+        return True
 
 
 class FakeAdapter:
@@ -72,12 +90,25 @@ class FakeAdapter:
         return {"disable_notification": True}
 
 
-def make_message(*, media_kind: str = "voice", business_id: str | None = "business-123"):
+def make_message(
+    *,
+    media_kind: str = "voice",
+    business_id: str | None = "business-123",
+    from_user_id: int = 2000,
+    caption: str | None = None,
+    caption_entities=(),
+    date: datetime | None = None,
+):
     kwargs = {
         "chat": SimpleNamespace(id=991),
         "message_id": 77,
+        "from_user": SimpleNamespace(id=from_user_id),
+        "date": date or datetime.now(timezone.utc),
         "voice": None,
         "video_note": None,
+        "caption": caption,
+        "caption_entities": caption_entities,
+        "sender_business_bot": None,
         "api_kwargs": {},
     }
     if business_id is not None:
@@ -398,6 +429,116 @@ async def test_end_to_end_processing_delegates_stt_replies_and_deletes_media(
             "reply_to_message_id": 77,
         }
     ]
+    assert bot.edit_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["voice", "video_note"])
+async def test_short_outgoing_transcript_edits_original_caption_without_duplicate_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch, media_kind: str
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    existing_entity = SimpleNamespace(type="bold", offset=0, length=8)
+    message = make_message(
+        media_kind=media_kind,
+        from_user_id=1000,
+        caption="Existing",
+        caption_entities=(existing_entity,),
+    )
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Short transcript"},
+    )
+
+    assert bot.business_connection_calls == ["business-123"]
+    assert bot.edit_calls == [
+        {
+            "chat_id": 991,
+            "message_id": 77,
+            "caption": "Existing\n\n🎙️ Short transcript",
+            "caption_entities": (existing_entity,),
+            "business_connection_id": "business-123",
+        }
+    ]
+    assert bot.calls == []
+
+
+def test_caption_fit_uses_telegram_utf16_limit_and_existing_caption(plugin):
+    message = make_message(caption="Existing")
+    prefix_units = plugin._telegram_text_length("Existing\n\n🎙️ ")
+    fitting = "x" * (plugin._MAX_CAPTION_CHARS - prefix_units)
+
+    assert plugin._build_transcript_caption(message, fitting) == f"Existing\n\n🎙️ {fitting}"
+    assert plugin._build_transcript_caption(message, fitting + "x") is None
+    assert plugin._telegram_text_length("🎙️") == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["expired", "api", "owner_lookup"])
+async def test_uneditable_outgoing_transcript_falls_back_to_separate_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch, failure: str
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    if failure == "expired":
+        message.date = datetime.now(timezone.utc) - timedelta(hours=49)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    if failure == "api":
+        bot.edit_error = RuntimeError("message can't be edited")
+    elif failure == "owner_lookup":
+        bot.business_connection_error = RuntimeError("connection lookup unavailable")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert bot.calls == [
+        {
+            "chat_id": 991,
+            "text": "🎙️ Fallback transcript",
+            "business_connection_id": "business-123",
+            "disable_notification": True,
+            "reply_to_message_id": 77,
+        }
+    ]
+    if failure == "expired":
+        assert bot.business_connection_calls == []
+        assert bot.edit_calls == []
+    elif failure == "api":
+        assert len(bot.edit_calls) == 1
+    else:
+        assert bot.edit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_over_caption_limit_transcript_skips_direction_lookup_and_uses_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+    transcript = "x" * plugin._MAX_CAPTION_CHARS
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": transcript},
+    )
+
+    assert bot.business_connection_calls == []
+    assert bot.edit_calls == []
+    assert bot.calls[0]["text"] == f"🎙️ {transcript}"
 
 
 @pytest.mark.asyncio
