@@ -4,6 +4,8 @@
 
 - Attach fitting transcripts to outgoing Business voice/video-note captions without a duplicate reply.
 - Preserve existing caption text and entities, and fall back to Business-scoped replies for incoming, long, expired, uncertain, or uneditable messages.
+- Render transcript caption blocks and reply chunks with native `expandable_blockquote` entities using UTF-16 offsets.
+- Keep long and emoji-heavy transcripts complete with UTF-16-safe chunking, and retry plain text when Telegram rejects expandable entities.
 
 ## 0.6.1 - 2026-07-18
 

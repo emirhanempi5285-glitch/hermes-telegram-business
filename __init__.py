@@ -423,38 +423,48 @@ async def _download_voice(message: Any, path: Path) -> Path:
     return path
 
 
+def _telegram_text_length(text: str) -> int:
+    """Return Telegram's UTF-16 code-unit length for a text field."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _utf16_prefix_index(text: str, limit: int) -> int:
+    """Return the largest Python string index that fits a UTF-16 budget."""
+    units = 0
+    for index, char in enumerate(text):
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if units + char_units > limit:
+            return index
+        units += char_units
+    return len(text)
+
+
 def _split_text(text: str, limit: int = _MAX_CHUNK_CHARS) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
-    if len(text) <= limit:
+    if _telegram_text_length(text) <= limit:
         return [text]
 
     chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for paragraph in re.split(r"(\n+)", text):
-        if not paragraph:
-            continue
-        if current_len + len(paragraph) <= limit:
-            current.append(paragraph)
-            current_len += len(paragraph)
-            continue
-        if current:
-            chunks.append("".join(current).strip())
-            current = []
-            current_len = 0
-        while len(paragraph) > limit:
-            cut = paragraph.rfind(" ", 0, limit)
-            if cut < limit // 2:
-                cut = limit
-            chunks.append(paragraph[:cut].strip())
-            paragraph = paragraph[cut:].lstrip()
-        if paragraph:
-            current = [paragraph]
-            current_len = len(paragraph)
-    if current:
-        chunks.append("".join(current).strip())
+    remaining = text
+    while _telegram_text_length(remaining) > limit:
+        hard_cut = _utf16_prefix_index(remaining, limit)
+        if hard_cut <= 0:
+            raise ValueError("text chunk limit is too small for one Unicode character")
+
+        newline_cut = remaining.rfind("\n", 0, hard_cut + 1)
+        space_cut = remaining.rfind(" ", 0, hard_cut + 1)
+        natural_cut = max(newline_cut, space_cut)
+        cut = natural_cut + 1 if natural_cut >= hard_cut // 2 else hard_cut
+        chunk = remaining[:cut].strip()
+        if not chunk:
+            cut = hard_cut
+            chunk = remaining[:cut]
+        chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
     return [c for c in chunks if c]
 
 
@@ -468,11 +478,6 @@ def _format_transcript_messages(transcript: str) -> list[str]:
     return messages
 
 
-def _telegram_text_length(text: str) -> int:
-    """Return Telegram's UTF-16 code-unit length for a text field."""
-    return len((text or "").encode("utf-16-le")) // 2
-
-
 def _build_transcript_caption(message: Any, transcript: str) -> Optional[str]:
     """Build a plain short-transcript caption without truncating either text."""
     transcript = (transcript or "").strip()
@@ -484,6 +489,35 @@ def _build_transcript_caption(message: Any, transcript: str) -> Optional[str]:
     if _telegram_text_length(caption) > _MAX_CAPTION_CHARS:
         return None
     return caption
+
+
+def _expandable_blockquote_entity(text: str, *, offset: int = 0) -> dict[str, Any]:
+    """Build a Telegram expandable-blockquote entity with UTF-16 positions."""
+    return {
+        "type": "expandable_blockquote",
+        "offset": offset,
+        "length": _telegram_text_length(text),
+    }
+
+
+def _build_transcript_caption_payload(
+    message: Any,
+    transcript: str,
+) -> Optional[tuple[str, tuple[Any, ...]]]:
+    """Build a fitting caption plus an entity that collapses the transcript block."""
+    caption = _build_transcript_caption(message, transcript)
+    if caption is None:
+        return None
+
+    transcript_block = f"🎙️ {(transcript or '').strip()}"
+    existing_caption = _get(message, "caption")
+    prefix = f"{existing_caption}\n\n" if existing_caption else ""
+    existing_entities = tuple(_get(message, "caption_entities") or ())
+    transcript_entity = _expandable_blockquote_entity(
+        transcript_block,
+        offset=_telegram_text_length(prefix),
+    )
+    return caption, (*existing_entities, transcript_entity)
 
 
 def _within_business_edit_window(message: Any, *, now: Optional[datetime] = None) -> bool:
@@ -522,9 +556,10 @@ async def _is_outgoing_business_message(*, bot: Any, message: Any) -> bool:
 
 async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: str) -> bool:
     """Attach a fitting outgoing transcript, returning False for safe reply fallback."""
-    caption = _build_transcript_caption(message, transcript)
-    if caption is None or not _within_business_edit_window(message):
+    payload = _build_transcript_caption_payload(message, transcript)
+    if payload is None or not _within_business_edit_window(message):
         return False
+    caption, caption_entities = payload
     if not await _is_outgoing_business_message(bot=bot, message=message):
         return False
 
@@ -538,13 +573,9 @@ async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: 
         "chat_id": chat_id,
         "message_id": message_id,
         "caption": caption,
+        "caption_entities": caption_entities,
         "business_connection_id": business_connection_id,
     }
-    caption_entities = _get(message, "caption_entities")
-    if caption_entities:
-        # Existing entity offsets remain valid because the old caption is kept
-        # byte-for-byte at the start and the transcript is appended as plain text.
-        kwargs["caption_entities"] = caption_entities
     try:
         result = await bot.edit_message_caption(**kwargs)
     except Exception as exc:  # noqa: BLE001 - Telegram edit failures must preserve delivery
@@ -714,12 +745,22 @@ def _get_adapter_and_bot(event: Any, gateway: Any) -> tuple[Any, Any]:
     return adapter, bot
 
 
+def _expandable_entity_unsupported(exc: Exception) -> bool:
+    """Identify entity-capability failures that are safe to retry as plain text."""
+    detail = str(exc).casefold().replace("’", "'")
+    return (
+        "expandable_blockquote" in detail
+        and any(marker in detail for marker in ("unsupported", "unknown", "invalid", "entity type"))
+    ) or "can't parse entities" in detail
+
+
 async def _send_transcript_messages(
     *,
     bot: Any,
     adapter: Any,
     message: Any,
     texts: Iterable[str],
+    collapsible: bool = True,
 ) -> None:
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     business_connection_id = _business_connection_id(message)
@@ -736,9 +777,18 @@ async def _send_transcript_messages(
             "business_connection_id": business_connection_id,
             **notify_kwargs,
         }
+        if collapsible:
+            kwargs["entities"] = (_expandable_blockquote_entity(text),)
         if first and reply_to_message_id is not None:
             kwargs["reply_to_message_id"] = reply_to_message_id
-        await bot.send_message(**kwargs)
+        try:
+            await bot.send_message(**kwargs)
+        except Exception as exc:
+            if not collapsible or not _expandable_entity_unsupported(exc):
+                raise
+            logger.info("%s: expandable transcript unavailable; using plain text: %s", _PLUGIN_NAME, exc)
+            fallback_kwargs = {key: value for key, value in kwargs.items() if key != "entities"}
+            await bot.send_message(**fallback_kwargs)
         first = False
 
 
@@ -752,6 +802,7 @@ async def _send_error_if_enabled(*, bot: Any, adapter: Any, message: Any, error:
             adapter=adapter,
             message=message,
             texts=[f"🎙️ Не смог распознать голосовое/видеокружок: {safe_error}"],
+            collapsible=False,
         )
     except Exception as exc:  # noqa: BLE001 - best-effort diagnostic path
         logger.debug("%s: failed to send STT error notice: %s", _PLUGIN_NAME, exc)
