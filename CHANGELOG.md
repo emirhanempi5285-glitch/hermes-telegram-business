@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Normalize Telegram Business identifiers, direction, timestamps, relationships, and media before routing events through independently enabled modules.
+- Add explicit handled/pass-through results, per-module LLM opt-in, stable retry identity, and failure isolation without adding persistence or provider clients.
+- Run the existing voice/video-note transcriber as the first module on the shared non-agent pipeline while preserving its Business-scoped behavior.
 - Attach fitting transcripts to outgoing Business voice/video-note captions without a duplicate reply.
 - Preserve existing caption text and entities, and fall back to Business-scoped replies for incoming, long, expired, uncertain, or uneditable messages.
 - Render transcript caption blocks and reply chunks with native `expandable_blockquote` entities using UTF-16 offsets.

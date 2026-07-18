@@ -17,10 +17,11 @@ An extensible [Hermes Agent](https://github.com/NousResearch/hermes-agent) integ
 8. Uses expandable Business-scoped replies for incoming, long, expired, or uneditable messages, with a plain-text retry when Telegram rejects the entity type.
 
 Duplicate updates are suppressed in memory for 24 hours. A successful caption edit suppresses the separate transcript reply, so the chat never receives both forms. Failed entity requests are not treated as delivered before the plain-text retry. The plugin never runs a separate model provider client and never needs its own credentials.
+Handled updates are identified from stable Telegram Business connection, chat, update/message, and relationship data, then suppressed in memory for 24 hours. A successful caption edit suppresses the separate transcript reply, so the chat never receives both forms. The plugin never runs a separate model provider client and never needs its own credentials.
 
 ## Roadmap
 
-The broader product direction includes message/media routing, operator or CRM integration adapters, and opt-in automation modules. These are planned extension points, not implemented features in `0.6.1`.
+The broader product direction includes operator or CRM integration adapters and opt-in automation modules. The small event/module boundary is now implemented; those product integrations are still planned extension points, not implemented features in `0.6.1`.
 
 ## Requirements
 
@@ -111,13 +112,18 @@ If the trust gate, provider, or model is unavailable, the plugin logs the cleanu
 
 ## Current module architecture
 
-The plugin registers one `pre_gateway_dispatch` hook. Matching updates are marked as handled immediately and processing continues in an asynchronous task:
+The plugin registers one `pre_gateway_dispatch` hook and normalizes Telegram Business updates before any module sees them. The immutable event includes stable identity, Business connection, chat/user/message/update identifiers, known direction, message/edit timestamps, reply/edit/delete relationships, and provider-neutral media metadata. Direction remains `unknown` when Telegram supplies no outgoing marker; the voice module retains its existing asynchronous Business-owner lookup before editing a caption.
+
+Modules are a small ordered tuple. Each module has its own enable check, declares whether it may receive the host-owned LLM facade, and explicitly returns `handled` or `pass_through`. A pass-through result leaves the ordinary Hermes path untouched. A handled result returns `action: skip` immediately and schedules any slow work outside gateway dispatch:
 
 ```text
-Telegram Business voice/video note
-  -> pre_gateway_dispatch filter + duplicate guard
-  -> action: skip (no agent turn)
-  -> transient download
+Telegram gateway event
+  -> normalize Telegram Business identity and relationships
+  -> enabled modules in order
+       -> pass_through: try next module / ordinary Hermes path
+       -> handled: duplicate guard + action: skip (no agent turn)
+  -> asynchronous module work
+  -> voice module: transient download
   -> Hermes transcribe_audio (configured host STT)
   -> optional ctx.llm structured cleanup
   -> lexical conservatism guard / raw fallback
@@ -136,12 +142,15 @@ Incoming messages, transcripts that do not fit in one caption, messages outside 
 - When cleanup is enabled, the configured host LLM receives the transcript. The system prompt treats transcript contents as untrusted data and forbids following embedded instructions.
 - The plugin does not log transcript text. Operational logs include media type, message/chat identifiers, character counts, and errors.
 - Error replies are disabled by default. When enabled, the first line of an exception may be sent to the Business chat.
-- The plugin stores only an in-process duplicate key for 24 hours; no transcript database is created.
+- The plugin stores only an in-process duplicate key for 24 hours. Its identity is deterministic across equivalent retry delivery, but the seen set intentionally resets with the process; no transcript/history database is created.
 - Existing Hermes/Telegram media caches are outside this plugin's ownership and are never scanned or deleted.
 
 ## Failure behavior
 
 - Non-Telegram, non-Business, and non-voice/video events pass through untouched.
+- Disabled and pass-through modules do not consume the event's duplicate identity.
+- A module enable/route exception is logged and contained, and later modules still receive the event.
+- Background module exceptions are contained and cannot crash the gateway.
 - Missing bot or Business connection data stops processing without invoking an agent.
 - STT failure sends nothing unless error replies are enabled.
 - Empty STT output sends nothing.
@@ -149,7 +158,6 @@ Incoming messages, transcripts that do not fit in one caption, messages outside 
 - Caption direction checks, length checks, edit-window checks, and API failures fall back to a separate expandable transcript reply.
 - A recognized unsupported-entity response retries the reply once without entities; unrelated send failures are not retried blindly.
 - A successful caption edit never also sends a transcript reply.
-- Hook-task exceptions are contained and cannot crash the gateway.
 
 ## Testing
 

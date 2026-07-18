@@ -380,6 +380,20 @@ def test_business_connection_id_can_come_from_api_kwargs(plugin):
     assert plugin._business_voice_message(make_event(message)) is message
 
 
+def test_cache_paths_are_unique_and_scoped_by_business_connection(plugin, monkeypatch):
+    first = make_message(business_id="connection/one")
+    second = make_message(business_id="connection:two")
+    monkeypatch.setattr(plugin.time, "time_ns", lambda: 123456789)
+
+    first_path = plugin._cache_path_for(first)
+    second_path = plugin._cache_path_for(second)
+
+    assert first_path != second_path
+    assert "business_connection_one_voice_123456789_991_77.ogg" == first_path.name
+    assert "business_connection_two_voice_123456789_991_77.ogg" == second_path.name
+    assert first_path.parent.name == LEGACY_PLUGIN_ID
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -391,6 +405,303 @@ def test_business_connection_id_can_come_from_api_kwargs(plugin):
 def test_nonmatching_events_pass_through(plugin, event):
     assert plugin._business_voice_message(event) is None
     assert plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace()) is None
+
+
+def test_normalizes_business_message_identity_relationships_and_media(plugin):
+    timestamp = datetime(2026, 7, 18, 10, 30, tzinfo=timezone.utc)
+    edit_timestamp = timestamp + timedelta(minutes=2)
+    message = make_message(date=timestamp)
+    message.edit_date = edit_timestamp
+    message.reply_to_message = SimpleNamespace(message_id=66)
+    message.sender_business_bot = SimpleNamespace(id=3000)
+    message.voice.file_id = "voice-file"
+    message.voice.file_unique_id = "voice-unique"
+    message.voice.mime_type = "audio/ogg"
+    message.voice.file_size = 1234
+    message.voice.duration = 9
+    event = make_event(message)
+    event.update_id = 4321
+    event.update_type = "edited_business_message"
+
+    normalized = plugin._normalize_business_event(event)
+    same_update = plugin._normalize_business_event(event)
+
+    assert normalized is not None
+    assert normalized.identity == same_update.identity
+    assert normalized.business_connection_id == "business-123"
+    assert normalized.chat_id == 991
+    assert normalized.user_id == 2000
+    assert normalized.sender_business_bot_id == 3000
+    assert normalized.message_id == 77
+    assert normalized.update_id == 4321
+    assert normalized.direction == "outgoing"
+    assert normalized.update_type == "edited_message"
+    assert normalized.timestamp == timestamp
+    assert normalized.edit_timestamp == edit_timestamp
+    assert normalized.reply_to_message_id == 66
+    assert normalized.edited_message_id == 77
+    assert normalized.deleted_message_ids == ()
+    assert normalized.media == plugin.MediaMetadata(
+        kind="voice",
+        file_id="voice-file",
+        file_unique_id="voice-unique",
+        mime_type="audio/ogg",
+        file_size=1234,
+        duration=9,
+        width=None,
+        height=None,
+        file_name=None,
+    )
+
+
+def test_normalizes_business_deletion_relationship(plugin):
+    deleted = SimpleNamespace(
+        business_connection_id="business-123",
+        chat=SimpleNamespace(id=991),
+        message_ids=[77, 78],
+        api_kwargs={},
+    )
+    event = make_event(deleted)
+    event.update_type = "deleted_business_messages"
+
+    normalized = plugin._normalize_business_event(event)
+
+    assert normalized is not None
+    assert normalized.update_type == "deleted_messages"
+    assert normalized.message_id is None
+    assert normalized.deleted_message_ids == (77, 78)
+    assert normalized.edited_message_id is None
+    assert normalized.direction == "unknown"
+    assert normalized.media is None
+
+
+def test_module_routing_is_configurable_and_llm_is_opt_in(plugin):
+    normalized = plugin._normalize_business_event(make_event(make_message()))
+    assert normalized is not None
+    llm = object()
+    contexts = []
+
+    disabled = plugin.EventModule(
+        name="disabled",
+        enabled=lambda: False,
+        route=lambda _event, _context: pytest.fail("disabled module was routed"),
+    )
+
+    def deterministic_route(_event, context):
+        contexts.append(context)
+        return plugin.ModuleResult.handled("deterministic_handled")
+
+    deterministic = plugin.EventModule(name="deterministic", route=deterministic_route)
+    result = plugin._route_modules(
+        normalized_event=normalized,
+        gateway=SimpleNamespace(),
+        modules=(disabled, deterministic),
+        llm=llm,
+    )
+
+    assert result.behavior == plugin.ModuleBehavior.HANDLED
+    assert result.reason == "deterministic_handled"
+    assert contexts[0].llm is None
+
+    opted_in = plugin.EventModule(
+        name="opted_in",
+        llm_opt_in=True,
+        route=lambda _event, context: (
+            contexts.append(context) or plugin.ModuleResult.pass_through()
+        ),
+    )
+    plugin._route_modules(
+        normalized_event=normalized,
+        gateway=SimpleNamespace(),
+        modules=(opted_in,),
+        llm=llm,
+    )
+    assert contexts[-1].llm is llm
+
+
+@pytest.mark.asyncio
+async def test_opted_out_voice_module_cannot_fall_back_to_global_llm(plugin, monkeypatch):
+    raw = (
+        "This transcript is deliberately long enough to cross the cleanup threshold while the voice module "
+        "is explicitly opted out of LLM access."
+    )
+    facade = SimpleNamespace(
+        acomplete_structured=AsyncMock(return_value=SimpleNamespace(parsed={"text": raw}, text=""))
+    )
+    plugin._llm_facade = facade
+    observed_llms = []
+
+    async def process(**kwargs):
+        observed_llms.append(kwargs["llm"])
+        assert await plugin._cleanup_transcript(raw, llm=kwargs["llm"]) == raw
+
+    monkeypatch.setattr(plugin, "_process_business_voice_event", process)
+    normalized = plugin._normalize_business_event(make_event(make_message()))
+    assert normalized is not None
+    opted_out_voice = plugin.EventModule(
+        name="opted_out_voice",
+        route=plugin._route_voice_module,
+        llm_opt_in=False,
+    )
+
+    result = plugin._route_modules(
+        normalized_event=normalized,
+        gateway=SimpleNamespace(),
+        modules=(opted_out_voice,),
+    )
+    assert result.work is not None
+    await result.work()
+
+    assert observed_llms == [None]
+    facade.acomplete_structured.assert_not_awaited()
+
+    observed_llms.clear()
+    normal_result = plugin._route_modules(normalized_event=normalized, gateway=SimpleNamespace())
+    assert normal_result.work is not None
+    await normal_result.work()
+
+    assert observed_llms == [facade]
+    facade.acomplete_structured.assert_awaited_once()
+
+
+def test_module_failure_is_contained_and_later_module_can_handle(plugin, caplog):
+    normalized = plugin._normalize_business_event(make_event(make_message()))
+    assert normalized is not None
+    routed = []
+
+    def broken_route(_event, _context):
+        raise RuntimeError("broken module")
+
+    def later_route(_event, _context):
+        routed.append("later")
+        return plugin.ModuleResult.handled("later_handled")
+
+    result = plugin._route_modules(
+        normalized_event=normalized,
+        gateway=SimpleNamespace(),
+        modules=(
+            plugin.EventModule(name="broken", route=broken_route),
+            plugin.EventModule(name="later", route=later_route),
+        ),
+    )
+
+    assert result.reason == "later_handled"
+    assert routed == ["later"]
+    assert "module broken routing failed" in caplog.text
+
+
+def test_pass_through_module_does_not_skip_or_consume_duplicate_identity(plugin, monkeypatch):
+    routed = []
+    module = plugin.EventModule(
+        name="observer",
+        route=lambda event, _context: (
+            routed.append(event.identity) or plugin.ModuleResult.pass_through()
+        ),
+    )
+    monkeypatch.setattr(plugin, "_MODULES", (module,))
+    event = make_event(make_message())
+
+    assert plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace()) is None
+    assert plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace()) is None
+    assert routed == [routed[0], routed[0]]
+
+
+@pytest.mark.asyncio
+async def test_handled_module_suppresses_duplicate_delivery_without_agent_turn(plugin, monkeypatch):
+    completed = asyncio.Event()
+    work = AsyncMock(side_effect=lambda: completed.set())
+    module = plugin.EventModule(
+        name="deterministic",
+        route=lambda _event, _context: plugin.ModuleResult.handled(
+            "deterministic_handled",
+            duplicate_reason="deterministic_duplicate",
+            work=work,
+        ),
+    )
+    monkeypatch.setattr(plugin, "_MODULES", (module,))
+    event = make_event(make_message())
+
+    first = plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace())
+    duplicate = plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace())
+    await asyncio.wait_for(completed.wait(), timeout=1)
+
+    assert first == {"action": "skip", "reason": "deterministic_handled"}
+    assert duplicate == {"action": "skip", "reason": "deterministic_duplicate"}
+    work.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_background_module_failure_is_contained(plugin, monkeypatch, caplog):
+    started = asyncio.Event()
+
+    async def broken_work():
+        started.set()
+        raise RuntimeError("background failure")
+
+    module = plugin.EventModule(
+        name="broken_background",
+        route=lambda _event, _context: plugin.ModuleResult.handled(
+            "background_handled",
+            work=broken_work,
+        ),
+    )
+    monkeypatch.setattr(plugin, "_MODULES", (module,))
+
+    result = plugin._on_pre_gateway_dispatch(
+        event=make_event(make_message()),
+        gateway=SimpleNamespace(),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert result == {"action": "skip", "reason": "background_handled"}
+    assert "async task failed: background failure" in caplog.text
+
+
+def test_sync_dispatch_runs_module_work_to_completion_without_a_worker_thread(plugin, monkeypatch):
+    completed = []
+
+    async def work():
+        await asyncio.sleep(0)
+        completed.append(True)
+
+    module = plugin.EventModule(
+        name="synchronous",
+        route=lambda _event, _context: plugin.ModuleResult.handled("sync_handled", work=work),
+    )
+    monkeypatch.setattr(plugin, "_MODULES", (module,))
+
+    result = plugin._on_pre_gateway_dispatch(event=make_event(make_message()), gateway=SimpleNamespace())
+
+    assert result == {"action": "skip", "reason": "sync_handled"}
+    assert completed == [True]
+
+
+@pytest.mark.asyncio
+async def test_gateway_tasks_are_retained_until_completion(plugin, monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def work():
+        started.set()
+        await release.wait()
+
+    module = plugin.EventModule(
+        name="retained",
+        route=lambda _event, _context: plugin.ModuleResult.handled("retained", work=work),
+    )
+    monkeypatch.setattr(plugin, "_MODULES", (module,))
+
+    result = plugin._on_pre_gateway_dispatch(event=make_event(make_message()), gateway=SimpleNamespace())
+    assert result == {"action": "skip", "reason": "retained"}
+    assert len(plugin._pending_tasks) == 1
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert plugin._pending_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -407,6 +718,54 @@ async def test_hook_skips_agent_path_and_suppresses_duplicate_update(plugin):
     assert first == {"action": "skip", "reason": "telegram_business_voice_media_transcribed"}
     assert second == {"action": "skip", "reason": "telegram_business_voice_media_duplicate"}
     process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["voice", "video_note"])
+async def test_edited_voice_media_is_skipped_without_retranscription(plugin, media_kind):
+    timestamp = datetime(2026, 7, 18, 10, 30, tzinfo=timezone.utc)
+    original = make_event(make_message(media_kind=media_kind, date=timestamp))
+    original.update_id = 100
+    original.update_type = "business_message"
+    edited_message = make_message(media_kind=media_kind, date=timestamp)
+    edited_message.edit_date = timestamp + timedelta(seconds=1)
+    edited = make_event(edited_message)
+    edited.update_id = 101
+    edited.update_type = "edited_business_message"
+    processed = asyncio.Event()
+    process = AsyncMock(side_effect=lambda **_kwargs: processed.set())
+    plugin._process_business_voice_event = process
+
+    original_result = plugin._on_pre_gateway_dispatch(event=original, gateway=SimpleNamespace())
+    edited_result = plugin._on_pre_gateway_dispatch(event=edited, gateway=SimpleNamespace())
+    await asyncio.wait_for(processed.wait(), timeout=1)
+
+    assert original_result == {"action": "skip", "reason": "telegram_business_voice_media_transcribed"}
+    assert edited_result == {"action": "skip", "reason": "telegram_business_voice_media_edit_ignored"}
+    process.assert_awaited_once()
+    assert process.await_args.kwargs["event"] is original
+
+
+def test_scheduling_failure_rolls_back_identity_for_retry(plugin, monkeypatch, caplog):
+    schedule_calls = []
+
+    def schedule(work):
+        schedule_calls.append(work)
+        if len(schedule_calls) == 1:
+            raise RuntimeError("loop unavailable")
+
+    monkeypatch.setattr(plugin, "_schedule_module_work", schedule)
+    event = make_event(make_message())
+
+    failed = plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace())
+    retried = plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace())
+    duplicate = plugin._on_pre_gateway_dispatch(event=event, gateway=SimpleNamespace())
+
+    assert failed == {"action": "skip", "reason": "telegram_business_voice_media_transcribed"}
+    assert retried == {"action": "skip", "reason": "telegram_business_voice_media_transcribed"}
+    assert duplicate == {"action": "skip", "reason": "telegram_business_voice_media_duplicate"}
+    assert len(schedule_calls) == 2
+    assert "failed to schedule module work: loop unavailable" in caplog.text
 
 
 @pytest.mark.asyncio

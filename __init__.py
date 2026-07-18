@@ -1,10 +1,10 @@
-"""Hermes Telegram Business — voice and video-note transcription module.
+"""Hermes Telegram Business — modular non-agent Business event processing.
 
-This first product module intercepts Telegram Business voice-like media before
-the normal Hermes auth and agent path, delegates speech recognition to the
-host's configured STT provider, optionally applies conservative LLM copy
-editing, and posts the transcript through the original
-``business_connection_id`` without an agent turn.
+Telegram Business updates are normalized and offered to small, isolated
+modules before the ordinary Hermes agent path. The first shipped module handles
+voice-like media, delegates speech recognition to the host, optionally uses the
+host LLM for conservative cleanup, and preserves ``business_connection_id`` on
+every outbound action.
 """
 
 from __future__ import annotations
@@ -18,10 +18,12 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 try:
     from hermes_constants import get_hermes_home
@@ -62,9 +64,103 @@ _BUSINESS_EDIT_WINDOW_SECONDS = 48 * 60 * 60
 _SEEN_TTL_SECONDS = 24 * 60 * 60
 
 _seen_lock = threading.Lock()
-_seen_messages: dict[tuple[str, str, str], float] = {}
+_seen_messages: dict[tuple[str, ...], float] = {}
+_pending_tasks: set[asyncio.Task[Any]] = set()
 _llm_facade: Any = None
 _adapter_compat_installed = False
+
+
+@dataclass(frozen=True)
+class MediaMetadata:
+    """Provider-neutral metadata for one Telegram media attachment."""
+
+    kind: str
+    file_id: Any = None
+    file_unique_id: Any = None
+    mime_type: Optional[str] = None
+    file_size: Optional[int] = None
+    duration: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    file_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TelegramBusinessEvent:
+    """Stable module-facing view of a Telegram Business gateway event."""
+
+    identity: tuple[str, ...]
+    business_connection_id: str
+    chat_id: Any
+    user_id: Any
+    sender_business_bot_id: Any
+    message_id: Any
+    update_id: Any
+    direction: str
+    update_type: str
+    timestamp: Optional[datetime]
+    edit_timestamp: Optional[datetime]
+    reply_to_message_id: Any
+    edited_message_id: Any
+    deleted_message_ids: tuple[Any, ...]
+    media: Optional[MediaMetadata]
+    raw_message: Any = field(repr=False, compare=False)
+    gateway_event: Any = field(repr=False, compare=False)
+
+
+class ModuleBehavior(str, Enum):
+    PASS_THROUGH = "pass_through"
+    HANDLED = "handled"
+
+
+@dataclass(frozen=True)
+class ModuleResult:
+    """An explicit decision returned by a module during synchronous routing."""
+
+    behavior: ModuleBehavior
+    reason: Optional[str] = None
+    duplicate_reason: Optional[str] = None
+    work: Optional[Callable[[], Awaitable[Any]]] = field(default=None, repr=False, compare=False)
+
+    @classmethod
+    def pass_through(cls) -> "ModuleResult":
+        return cls(ModuleBehavior.PASS_THROUGH)
+
+    @classmethod
+    def handled(
+        cls,
+        reason: str,
+        *,
+        duplicate_reason: Optional[str] = None,
+        work: Optional[Callable[[], Awaitable[Any]]] = None,
+    ) -> "ModuleResult":
+        return cls(
+            ModuleBehavior.HANDLED,
+            reason=reason,
+            duplicate_reason=duplicate_reason,
+            work=work,
+        )
+
+
+@dataclass(frozen=True)
+class ModuleContext:
+    gateway: Any
+    llm: Any = None
+
+
+def _module_enabled() -> bool:
+    return True
+
+
+@dataclass(frozen=True)
+class EventModule:
+    """Small configuration and routing boundary for one Business event module."""
+
+    name: str
+    route: Callable[[TelegramBusinessEvent, ModuleContext], ModuleResult]
+    enabled: Callable[[], bool] = _module_enabled
+    llm_opt_in: bool = False
+
 
 _CLEANUP_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -341,18 +437,9 @@ def _completion_max_tokens(transcript: str) -> int:
     return max(512, min(4096, int(len(transcript or "") / 2) + 256))
 
 
-def _message_key(message: Any) -> tuple[str, str, str]:
-    return (
-        str(_business_connection_id(message) or ""),
-        str(getattr(getattr(message, "chat", None), "id", "") or ""),
-        str(getattr(message, "message_id", "") or ""),
-    )
-
-
-def _mark_seen(message: Any) -> bool:
-    """Return True if this media message was not already accepted for processing."""
-    key = _message_key(message)
-    if not all(key):
+def _mark_identity_seen(key: tuple[str, ...]) -> bool:
+    """Suppress retry delivery for a stable identity within this process."""
+    if not key or not all(key):
         return True
     now = time.time()
     cutoff = now - _SEEN_TTL_SECONDS
@@ -366,11 +453,220 @@ def _mark_seen(message: Any) -> bool:
         return True
 
 
+def _forget_identity(key: tuple[str, ...]) -> None:
+    with _seen_lock:
+        _seen_messages.pop(key, None)
+
+
 def _is_telegram_event(event: Any) -> bool:
-    source = getattr(event, "source", None)
-    platform = getattr(source, "platform", None)
-    value = getattr(platform, "value", platform)
+    source = _get(event, "source")
+    platform = _get(source, "platform")
+    value = _get(platform, "value", platform)
     return str(value) == "telegram"
+
+
+_UPDATE_TYPES = {
+    "business_message": "message",
+    "message": "message",
+    "edited_business_message": "edited_message",
+    "edited_message": "edited_message",
+    "deleted_business_messages": "deleted_messages",
+    "deleted_messages": "deleted_messages",
+}
+
+_MEDIA_KINDS = (
+    "voice",
+    "video_note",
+    "audio",
+    "video",
+    "animation",
+    "document",
+    "photo",
+    "sticker",
+)
+
+
+def _normalize_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return None
+
+
+def _business_update_type(event: Any, message: Any) -> str:
+    source = _get(event, "source")
+    explicit = (
+        _get(event, "update_type")
+        or _get(message, "_hermes_update_type")
+        or _get(source, "update_type")
+    )
+    if explicit:
+        value = str(getattr(explicit, "value", explicit)).strip().lower()
+        return _UPDATE_TYPES.get(value, value)
+
+    raw_update = _get(event, "raw_update")
+    if raw_update is None:
+        raw_update = _get(event, "update")
+    for attribute, normalized in (
+        ("edited_business_message", "edited_message"),
+        ("deleted_business_messages", "deleted_messages"),
+        ("business_message", "message"),
+    ):
+        if _get(raw_update, attribute) is not None:
+            return normalized
+
+    if _get(message, "message_ids") is not None:
+        return "deleted_messages"
+    if _get(message, "edit_date") is not None:
+        return "edited_message"
+    return "message"
+
+
+def _event_direction(event: Any, message: Any) -> str:
+    source = _get(event, "source")
+    explicit = (
+        _get(event, "direction")
+        or _get(message, "_hermes_business_direction")
+        or _get(source, "direction")
+    )
+    if explicit:
+        value = str(getattr(explicit, "value", explicit)).strip().lower()
+        if value in {"incoming", "inbound", "received"}:
+            return "incoming"
+        if value in {"outgoing", "outbound", "sent"}:
+            return "outgoing"
+    if _get(message, "sender_business_bot") is not None:
+        return "outgoing"
+    return "unknown"
+
+
+def _media_metadata(message: Any) -> Optional[MediaMetadata]:
+    for kind in _MEDIA_KINDS:
+        payload = _get(message, kind)
+        if payload is None:
+            continue
+        if kind == "photo" and isinstance(payload, (list, tuple)):
+            payload = payload[-1] if payload else None
+            if payload is None:
+                continue
+        width = _get(payload, "width")
+        height = _get(payload, "height")
+        if kind == "video_note":
+            length = _get(payload, "length")
+            width = width if width is not None else length
+            height = height if height is not None else length
+        return MediaMetadata(
+            kind=kind,
+            file_id=_get(payload, "file_id"),
+            file_unique_id=_get(payload, "file_unique_id"),
+            mime_type=_get(payload, "mime_type"),
+            file_size=_get(payload, "file_size"),
+            duration=_get(payload, "duration"),
+            width=width,
+            height=height,
+            file_name=_get(payload, "file_name"),
+        )
+    return None
+
+
+def _event_identity(
+    *,
+    business_connection_id: Any,
+    chat_id: Any,
+    update_type: str,
+    message_id: Any,
+    update_id: Any,
+    edit_timestamp: Optional[datetime],
+    deleted_message_ids: tuple[Any, ...],
+) -> tuple[str, ...]:
+    if not business_connection_id or chat_id is None:
+        return ()
+
+    if deleted_message_ids:
+        relationship = "deleted:" + ",".join(str(value) for value in deleted_message_ids)
+    elif message_id is not None:
+        relationship = f"message:{message_id}"
+        if update_type == "edited_message" and edit_timestamp is not None:
+            relationship += f":{edit_timestamp.isoformat()}"
+    elif update_id is not None:
+        relationship = f"update:{update_id}"
+    else:
+        return ()
+
+    identity = (
+        str(business_connection_id),
+        str(chat_id),
+        update_type,
+        relationship,
+    )
+    if update_id is not None:
+        identity += (f"update:{update_id}",)
+    return identity
+
+
+def _normalize_business_event(event: Any) -> Optional[TelegramBusinessEvent]:
+    """Return the module-facing Business event, or None for unsupported input."""
+    if not _is_telegram_event(event):
+        return None
+    message = _get(event, "raw_message")
+    if message is None:
+        return None
+    business_connection_id = _business_connection_id(message)
+    if not business_connection_id:
+        if _is_business_message(message) and _transcribable_payload(message) is not None:
+            logger.warning("%s: Telegram Business media has no business_connection_id", _PLUGIN_NAME)
+        return None
+
+    chat_id = _get(_get(message, "chat"), "id")
+    message_id = _get(message, "message_id")
+    update_id = _get(event, "update_id")
+    if update_id is None:
+        raw_update = _get(event, "raw_update")
+        if raw_update is None:
+            raw_update = _get(event, "update")
+        update_id = _get(raw_update, "update_id")
+    update_type = _business_update_type(event, message)
+    timestamp = _normalize_timestamp(_get(message, "date"))
+    edit_timestamp = _normalize_timestamp(_get(message, "edit_date"))
+    reply_to_message_id = _get(_get(message, "reply_to_message"), "message_id")
+    deleted_message_ids = tuple(_get(message, "message_ids") or ())
+    sender_business_bot = _get(message, "sender_business_bot")
+    user = _get(message, "from_user")
+    identity = _event_identity(
+        business_connection_id=business_connection_id,
+        chat_id=chat_id,
+        update_type=update_type,
+        message_id=message_id,
+        update_id=update_id,
+        edit_timestamp=edit_timestamp,
+        deleted_message_ids=deleted_message_ids,
+    )
+
+    return TelegramBusinessEvent(
+        identity=identity,
+        business_connection_id=str(business_connection_id),
+        chat_id=chat_id,
+        user_id=_get(user, "id"),
+        sender_business_bot_id=_get(sender_business_bot, "id"),
+        message_id=message_id,
+        update_id=update_id,
+        direction=_event_direction(event, message),
+        update_type=update_type,
+        timestamp=timestamp,
+        edit_timestamp=edit_timestamp,
+        reply_to_message_id=reply_to_message_id,
+        edited_message_id=message_id if update_type == "edited_message" else None,
+        deleted_message_ids=deleted_message_ids,
+        media=_media_metadata(message),
+        raw_message=message,
+        gateway_event=event,
+    )
 
 
 def _business_voice_message(event: Any) -> Optional[Any]:
@@ -401,15 +697,15 @@ def _transcribable_payload(message: Any) -> Optional[tuple[Any, str, str]]:
 
 
 def _cache_path_for(message: Any) -> Path:
+    business_connection_id = _safe_part(_business_connection_id(message))
     chat_id = _safe_part(getattr(getattr(message, "chat", None), "id", "chat"))
     message_id = _safe_part(getattr(message, "message_id", "message"))
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     payload = _transcribable_payload(message)
     label = payload[1] if payload else "media"
     ext = payload[2] if payload else ".ogg"
     root = get_hermes_home() / "cache" / _PLUGIN_NAME
     root.mkdir(parents=True, exist_ok=True)
-    return root / f"business_{label}_{stamp}_{chat_id}_{message_id}{ext}"
+    return root / f"business_{business_connection_id}_{label}_{time.time_ns()}_{chat_id}_{message_id}{ext}"
 
 
 async def _download_voice(message: Any, path: Path) -> Path:
@@ -678,7 +974,6 @@ async def _cleanup_transcript(
             logger.warning("%s: injected cleanup failed: %s", _PLUGIN_NAME, exc)
             return transcript
 
-    llm = llm or _llm_facade
     if llm is None:
         logger.debug("%s: no plugin LLM facade; posting raw transcript", _PLUGIN_NAME)
         return transcript
@@ -875,32 +1170,122 @@ async def _process_business_voice_event(
             logger.warning("%s: failed to remove transient media: %s", _PLUGIN_NAME, exc)
 
 
+def _voice_module_enabled() -> bool:
+    return not _disabled()
+
+
+def _route_voice_module(event: TelegramBusinessEvent, context: ModuleContext) -> ModuleResult:
+    if event.media is None or event.media.kind not in {"voice", "video_note"}:
+        return ModuleResult.pass_through()
+    if event.update_type == "edited_message":
+        return ModuleResult.handled("telegram_business_voice_media_edit_ignored")
+
+    async def process() -> None:
+        await _process_business_voice_event(
+            event=event.gateway_event,
+            gateway=context.gateway,
+            llm=context.llm,
+        )
+
+    return ModuleResult.handled(
+        "telegram_business_voice_media_transcribed",
+        duplicate_reason="telegram_business_voice_media_duplicate",
+        work=process,
+    )
+
+
+_MODULES = (
+    EventModule(
+        name="voice_transcription",
+        route=_route_voice_module,
+        enabled=_voice_module_enabled,
+        llm_opt_in=True,
+    ),
+)
+
+
+def _route_modules(
+    *,
+    normalized_event: TelegramBusinessEvent,
+    gateway: Any,
+    modules: Optional[Iterable[EventModule]] = None,
+    llm: Any = None,
+) -> ModuleResult:
+    """Return the first handled result while containing each module's failures."""
+    selected_modules = _MODULES if modules is None else modules
+    host_llm = _llm_facade if llm is None else llm
+    for module in selected_modules:
+        try:
+            enabled = module.enabled()
+        except Exception as exc:  # noqa: BLE001 - one bad module cannot break dispatch
+            logger.warning("%s: module %s enable check failed: %s", _PLUGIN_NAME, module.name, exc, exc_info=True)
+            continue
+        if not enabled:
+            continue
+
+        context = ModuleContext(
+            gateway=gateway,
+            llm=host_llm if module.llm_opt_in else None,
+        )
+        try:
+            result = module.route(normalized_event, context)
+        except Exception as exc:  # noqa: BLE001 - later modules must still get the event
+            logger.warning("%s: module %s routing failed: %s", _PLUGIN_NAME, module.name, exc, exc_info=True)
+            continue
+        if not isinstance(result, ModuleResult):
+            logger.warning("%s: module %s returned an invalid result", _PLUGIN_NAME, module.name)
+            continue
+        if result.behavior is ModuleBehavior.HANDLED:
+            return result
+    return ModuleResult.pass_through()
+
+
 def _task_done(task: asyncio.Task[Any]) -> None:
+    _pending_tasks.discard(task)
     try:
         task.result()
     except asyncio.CancelledError:
         pass
-    except Exception as exc:  # pragma: no cover - _process catches its own errors
+    except Exception as exc:
         logger.warning("%s: async task failed: %s", _PLUGIN_NAME, exc, exc_info=True)
 
 
-def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[dict[str, str]]:
-    message = _business_voice_message(event)
-    if message is None:
-        return None
+async def _run_module_work(work: Callable[[], Awaitable[Any]]) -> None:
+    await _maybe_await(work())
 
-    if not _mark_seen(message):
-        return {"action": "skip", "reason": "telegram_business_voice_media_duplicate"}
 
+def _schedule_module_work(work: Optional[Callable[[], Awaitable[Any]]]) -> None:
+    if work is None:
+        return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        asyncio.run(_process_business_voice_event(event=event, gateway=gateway))
-    else:
-        task = loop.create_task(_process_business_voice_event(event=event, gateway=gateway))
-        task.add_done_callback(_task_done)
+        asyncio.run(_run_module_work(work))
+        return
+    task = loop.create_task(_run_module_work(work))
+    _pending_tasks.add(task)
+    task.add_done_callback(_task_done)
 
-    return {"action": "skip", "reason": "telegram_business_voice_media_transcribed"}
+
+def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> Optional[dict[str, str]]:
+    normalized_event = _normalize_business_event(event)
+    if normalized_event is None:
+        return None
+
+    result = _route_modules(normalized_event=normalized_event, gateway=gateway)
+    if result.behavior is ModuleBehavior.PASS_THROUGH:
+        return None
+
+    if not _mark_identity_seen(normalized_event.identity):
+        duplicate_reason = result.duplicate_reason or f"{result.reason or 'telegram_business_event'}_duplicate"
+        return {"action": "skip", "reason": duplicate_reason}
+
+    try:
+        _schedule_module_work(result.work)
+    except Exception as exc:  # noqa: BLE001 - dispatch must survive scheduling failure
+        _forget_identity(normalized_event.identity)
+        logger.warning("%s: failed to schedule module work: %s", _PLUGIN_NAME, exc, exc_info=True)
+    return {"action": "skip", "reason": result.reason or "telegram_business_event_handled"}
 
 
 def register(ctx: Any) -> None:
