@@ -191,8 +191,8 @@ def test_manifest_uses_current_fields():
         "name": LEGACY_PLUGIN_ID,
         "version": "0.6.1",
         "description": (
-            "Update-persistent Hermes Telegram Business integration with voice and video-note transcription, "
-            "conservative transcript cleanup, and Business-scoped replies."
+            "Update-persistent Hermes Telegram Business integration with voice/video-note transcription and "
+            "opt-in no-agent text history."
         ),
         "author": "neoromantic",
         "kind": "standalone",
@@ -206,8 +206,8 @@ def test_package_metadata_uses_public_product_identity():
     assert metadata["name"] == "hermes-telegram-business"
     assert metadata["version"] == "0.6.1"
     assert metadata["description"] == (
-        "Update-persistent Telegram Business integration for Hermes Agent with voice and video-note "
-        "transcription and Business-scoped replies."
+        "Update-persistent Telegram Business integration for Hermes Agent with voice/video-note transcription "
+        "and opt-in no-agent text history."
     )
     assert metadata["urls"] == {
         "Homepage": CANONICAL_REPOSITORY,
@@ -224,7 +224,29 @@ def test_readme_uses_public_name_and_canonical_install_source():
     assert f"{CANONICAL_REPOSITORY}/actions/workflows/test.yml" in readme
     assert "hermes plugins install neoromantic/hermes-telegram-business --enable" in readme
     assert "legacy-stable" in readme
-    assert "not implemented" in readme
+    assert "HERMES_TELEGRAM_BUSINESS_HISTORY_ENABLE" in readme
+    assert "hermes telegram-business history show" in readme
+    assert "Update.ALL_TYPES" in readme
+    assert "PTB 22.6" in readme
+    assert "`Message.text` only" in readme
+    assert "`source`" in readme
+    assert "`classification_reason`" in readme
+    assert "`0` disables retention pruning" in readme
+    assert "`1073741824`" in readme
+
+
+def test_history_skill_documents_runtime_scheduler_and_defaults():
+    skill = (ROOT / "skills" / "history" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert skill.startswith("---\nname: history\n")
+    assert "description:" in skill
+    assert "Message.text" in skill
+    assert "Update.ALL_TYPES" in skill
+    assert "`source`" in skill
+    assert "`classification_reason`" in skill
+    assert "default `0`" in skill
+    assert "1073741824" in skill
+    assert "does not depend on `maintain`" in skill
 
 
 def test_ci_runs_on_main_and_version_tags():
@@ -275,18 +297,47 @@ def test_optional_telegram_error_names_are_import_safe(monkeypatch: pytest.Monke
     ) is compat_plugin.CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE
 
 
-def test_registers_only_pre_gateway_dispatch_hook(plugin):
+def test_register_registers_hook_cli_and_skill_when_supported(plugin):
     llm = object()
     registrations = []
+    cli_registrations = []
+    skill_registrations = []
     ctx = SimpleNamespace(
         llm=llm,
         register_hook=lambda name, callback: registrations.append((name, callback)),
+        register_cli_command=lambda **kwargs: cli_registrations.append(kwargs),
+        register_skill=lambda name, path, description="": skill_registrations.append((name, path, description)),
     )
 
     plugin.register(ctx)
 
     assert plugin._llm_facade is llm
     assert registrations == [("pre_gateway_dispatch", plugin._on_pre_gateway_dispatch)]
+    assert cli_registrations == [
+        {
+            "name": "telegram-business",
+            "help": "Read and maintain Telegram Business history",
+            "setup_fn": plugin._history_support.setup_cli,
+            "handler_fn": plugin._history_support.handle_cli,
+            "description": "Telegram Business history, verification, and maintenance",
+        }
+    ]
+    assert skill_registrations == [
+        (
+            "history",
+            plugin._history_support.skill_path(),
+            "Telegram Business history schema, safe read recipes, and maintenance guidance.",
+        )
+    ]
+
+
+def test_register_is_compatible_with_minimal_fake_context(plugin):
+    ctx = SimpleNamespace(
+        llm=None,
+        register_hook=lambda name, callback: None,
+    )
+
+    plugin.register(ctx)
 
 
 def _install_fake_telegram_adapter(monkeypatch: pytest.MonkeyPatch):

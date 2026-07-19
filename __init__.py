@@ -10,6 +10,7 @@ every outbound action.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import json
 import logging
@@ -101,6 +102,26 @@ _seen_messages: dict[tuple[str, ...], float] = {}
 _pending_tasks: set[asyncio.Task[Any]] = set()
 _llm_facade: Any = None
 _adapter_compat_installed = False
+_RAW_HISTORY_HANDLER_GROUP = -100
+_RAW_HISTORY_HANDLER_MARKER = "_hermes_business_history_raw_handler"
+
+
+def _load_local_support_module(filename: str, suffix: str) -> Any:
+    path = Path(__file__).resolve().with_name(filename)
+    module_name = f"{__name__}_{suffix}"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load support module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_history_support = _load_local_support_module("history_support.py", "history_support")
 
 
 @dataclass(frozen=True)
@@ -319,6 +340,57 @@ def _is_business_voice_media(message: Any) -> bool:
     )
 
 
+def _is_raw_business_update(update: Any) -> bool:
+    return any(
+        getattr(update, attribute, None) is not None
+        for attribute in ("business_message", "edited_business_message", "deleted_business_messages")
+    )
+
+
+async def _observe_raw_business_update(update: Any, context: Any) -> None:
+    try:
+        await _history_support.observe_ptb_update(update, bot=getattr(context, "bot", None))
+    except Exception as exc:  # noqa: BLE001 - history observation must never break the gateway
+        logger.warning("%s: business history observation failed: %s", _PLUGIN_NAME, exc, exc_info=True)
+
+
+def _build_raw_business_update_handler() -> Any:
+    try:
+        from telegram.ext import BaseHandler
+    except Exception:
+        BaseHandler = None
+
+    if BaseHandler is None:
+
+        class _FallbackRawBusinessHandler:
+            def __init__(self, callback: Callable[[Any, Any], Awaitable[Any]]) -> None:
+                self.callback = callback
+                self.block = True
+
+            def check_update(self, update: object) -> bool:
+                return _is_raw_business_update(update)
+
+        return _FallbackRawBusinessHandler(_observe_raw_business_update)
+
+    class _RawBusinessUpdateHandler(BaseHandler):  # type: ignore[misc]
+        def __init__(self, callback: Callable[[Any, Any], Awaitable[Any]]) -> None:
+            super().__init__(callback, block=True)
+
+        def check_update(self, update: object) -> bool:
+            return _is_raw_business_update(update)
+
+    return _RawBusinessUpdateHandler(_observe_raw_business_update)
+
+
+def _install_raw_business_update_handler(app: Any, add_handler: Callable[..., Any]) -> bool:
+    if app is None or getattr(app, _RAW_HISTORY_HANDLER_MARKER, None) is not None:
+        return False
+    handler = _build_raw_business_update_handler()
+    add_handler(app, handler, group=_RAW_HISTORY_HANDLER_GROUP)
+    setattr(app, _RAW_HISTORY_HANDLER_MARKER, handler)
+    return True
+
+
 def _resolve_telegram_adapter_module() -> Any:
     """Return the module that owns Hermes's registered Telegram adapter.
 
@@ -410,6 +482,21 @@ def _install_telegram_adapter_compat() -> bool:
 
         _compat_message_handler._hermes_business_compat = True  # type: ignore[attr-defined]
         telegram_adapter.TelegramMessageHandler = _compat_message_handler
+
+    application_cls = getattr(telegram_adapter, "Application", None)
+    original_add_handler = getattr(application_cls, "add_handler", None) if application_cls is not None else None
+    if callable(original_add_handler) and not getattr(original_add_handler, "_hermes_business_compat", False):
+
+        def _compat_add_handler(self: Any, handler: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(self, _RAW_HISTORY_HANDLER_MARKER, None) is None:
+                try:
+                    _install_raw_business_update_handler(self, original_add_handler)
+                except Exception as exc:  # noqa: BLE001 - gateway startup must remain available
+                    logger.warning("%s: raw Telegram Business history handler unavailable: %s", _PLUGIN_NAME, exc)
+            return original_add_handler(self, handler, *args, **kwargs)
+
+        _compat_add_handler._hermes_business_compat = True  # type: ignore[attr-defined]
+        application_cls.add_handler = _compat_add_handler
 
     _adapter_compat_installed = True
     logger.info("%s: installed update-persistent Telegram Business adapter compatibility", _PLUGIN_NAME)
@@ -1453,8 +1540,54 @@ def _on_pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -
     return {"action": "skip", "reason": result.reason or "telegram_business_event_handled"}
 
 
+def _register_history_cli(ctx: Any) -> None:
+    register_cli_command = getattr(ctx, "register_cli_command", None)
+    if not callable(register_cli_command):
+        return
+    register_cli_command(
+        name="telegram-business",
+        help="Read and maintain Telegram Business history",
+        setup_fn=_history_support.setup_cli,
+        handler_fn=_history_support.handle_cli,
+        description="Telegram Business history, verification, and maintenance",
+    )
+
+
+def _register_history_skill(ctx: Any) -> None:
+    register_skill = getattr(ctx, "register_skill", None)
+    if not callable(register_skill):
+        return
+    skill_md = _history_support.skill_path()
+    register_skill(
+        "history",
+        skill_md,
+        "Telegram Business history schema, safe read recipes, and maintenance guidance.",
+    )
+
+
+def _run_startup_history_maintenance() -> None:
+    try:
+        result = _history_support.run_startup_maintenance()
+    except Exception as exc:  # noqa: BLE001 - plugin load must stay available
+        logger.warning("%s: startup history maintenance failed: %s", _PLUGIN_NAME, exc, exc_info=True)
+        return
+    if result.cap_exceeded:
+        logger.warning(
+            "%s: history size cap exceeded by %d bytes; active month files were preserved",
+            _PLUGIN_NAME,
+            result.cap_shortfall_bytes,
+        )
+    for warning in result.warnings:
+        logger.warning("%s: %s", _PLUGIN_NAME, warning)
+
+
 def register(ctx: Any) -> None:
     global _llm_facade
     _llm_facade = getattr(ctx, "llm", None)
     _install_telegram_adapter_compat()
-    ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    _register_history_cli(ctx)
+    _register_history_skill(ctx)
+    _run_startup_history_maintenance()

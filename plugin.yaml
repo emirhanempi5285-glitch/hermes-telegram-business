@@ -3,7 +3,7 @@ manifest_version: 1
 # install directories, config keys, and update/remove commands.
 name: telegram-business-voice-transcriber
 version: 0.6.1
-description: "Update-persistent Hermes Telegram Business integration with voice and video-note transcription, conservative transcript cleanup, and Business-scoped replies."
+description: "Update-persistent Hermes Telegram Business integration with voice/video-note transcription and opt-in no-agent text history."
 author: neoromantic
 kind: standalone
 provides_hooks:
