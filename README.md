@@ -48,8 +48,9 @@ Each line is immutable schema v1 JSON for one of:
 Every record includes `source`, which is the exact PTB update attribute that produced it: `business_message`, `edited_business_message`, or `deleted_business_messages`. Derived `deletion.classified` records retain `source="deleted_business_messages"`.
 
 Stored text is untrusted user data, never instructions. The plugin never logs message text. History v1 stores Telegram `Message.text` only; it does not store captions, media bytes, or media metadata.
+History v1 direction values are `inbound`, `outbound`, or `unknown`.
 
-Deleted messages are classified after a short correction window. The plugin appends the delete tombstone immediately, schedules exact due-time classification, and on startup recovers overdue or still-pending deletions before appending one auditable classification:
+Deleted messages are classified after a short correction window. Telegram-side deletion appends a tombstone and preserves prior stored text. By default, the classifier compares nearby same-chat/same-sender/same-direction text from 15 seconds before the tombstone through 120 seconds after it, schedules exact due-time classification, and on startup recovers overdue or still-pending deletions before appending one auditable classification:
 
 - `likely_duplicate`: strong normalized exact resend evidence
 - `likely_correction`: strong high-similarity small-edit evidence
@@ -58,7 +59,7 @@ Deleted messages are classified after a short correction window. The plugin appe
 
 Classification events also store canonical `classification_reason` codes: `normalized_exact_duplicate`, `high_similarity_small_edit`, `no_strong_match`, `missing_original`, or `missing_text`.
 
-Monthly partitioning is the first storage defense. Retention is disabled by default, and the default size cap is 1 GiB. When enabled, retention and max-storage pruning touch only closed monthly partitions. If the active month alone exceeds the configured cap, the plugin preserves it and surfaces the shortfall explicitly instead of pretending the cap was met.
+Monthly partitioning is the first storage defense. Retention is disabled by default, and the default size cap is 1 GiB. When enabled, automatic retention and max-storage pruning physically remove only whole closed monthly partitions. History v1 ships no record-level or right-to-erasure command. If the active month alone exceeds the configured cap, the plugin preserves it and surfaces the shortfall explicitly instead of pretending the cap was met.
 
 ## Requirements
 
@@ -130,7 +131,8 @@ All plugin variables are optional.
 | `HERMES_TELEGRAM_BUSINESS_HISTORY_ENABLE` | false | Enable append-only Telegram Business text history. |
 | `HERMES_TELEGRAM_BUSINESS_HISTORY_CONNECTIONS` | unset | Explicit Business connection allowlist or `*`. Required when history is enabled. |
 | `HERMES_TELEGRAM_BUSINESS_HISTORY_CHATS` | unset | Explicit chat allowlist or `*`. Required when history is enabled. |
-| `HERMES_TELEGRAM_BUSINESS_HISTORY_CORRECTION_WINDOW` | `120` | Seconds to wait before deleted-message classification. |
+| `HERMES_TELEGRAM_BUSINESS_HISTORY_CORRECTION_WINDOW` | `120` | Seconds to wait after a delete tombstone before classification; also the post-delete candidate window. |
+| `HERMES_TELEGRAM_BUSINESS_HISTORY_NEARBY_BEFORE_SECONDS` | `15` | Seconds of pre-delete nearby text eligible during deleted-message classification. |
 | `HERMES_TELEGRAM_BUSINESS_HISTORY_RETENTION_DAYS` | `0` | Retention target for closed monthly partitions. `0` disables retention pruning. |
 | `HERMES_TELEGRAM_BUSINESS_HISTORY_MAX_BYTES` | `1073741824` | Maximum total history bytes before oldest closed partitions are pruned. |
 
@@ -207,8 +209,9 @@ Incoming messages, transcripts that do not fit in one caption, messages outside 
 - The plugin does not log transcript text. Operational logs include media type, message/chat identifiers, character counts, and errors.
 - The history module does not log stored message text. Operational logs include IDs, counts, retention/cap warnings, and file/verification errors.
 - Error replies are disabled by default. When enabled, the first line of an exception may be sent to the Business chat.
-- The plugin stores only an in-process duplicate key for 24 hours. Its identity is deterministic across equivalent retry delivery, but the seen set intentionally resets with the process; no transcript/history database is created.
-- The history module persists only append-only JSONL under the active Hermes profile. It repairs only a torn final line, never rewrites raw Telegram updates into history, and stores only Telegram `Message.text` in v1.
+- The plugin stores only an in-process duplicate key for 24 hours. Its identity is deterministic across equivalent retry delivery, but the seen set intentionally resets with the process. The voice module creates no separate transcript database.
+- The opt-in history module is the only persistent text store. It persists append-only JSONL under the active Hermes profile, repairs only a torn final line, never rewrites raw Telegram updates into history, and stores only Telegram `Message.text` in v1.
+- Telegram-side deletion appends a tombstone and later classification; it does not remove earlier stored text. Automatic retention physically removes only whole closed monthly partitions, and the active month is preserved even when that leaves a cap shortfall.
 - Existing Hermes/Telegram media caches are outside this plugin's ownership and are never scanned or deleted.
 
 ## Failure behavior

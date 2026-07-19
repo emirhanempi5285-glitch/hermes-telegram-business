@@ -46,10 +46,12 @@ HISTORY_ENABLE_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_ENABLE"
 HISTORY_CONNECTIONS_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_CONNECTIONS"
 HISTORY_CHATS_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_CHATS"
 HISTORY_CORRECTION_WINDOW_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_CORRECTION_WINDOW"
+HISTORY_NEARBY_BEFORE_SECONDS_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_NEARBY_BEFORE_SECONDS"
 HISTORY_RETENTION_DAYS_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_RETENTION_DAYS"
 HISTORY_MAX_BYTES_ENV = "HERMES_TELEGRAM_BUSINESS_HISTORY_MAX_BYTES"
 
 DEFAULT_CORRECTION_WINDOW_SECONDS = 120
+DEFAULT_NEARBY_BEFORE_SECONDS = 15
 DEFAULT_RETENTION_DAYS = 0
 DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
 DEFAULT_READ_LIMIT = 200
@@ -88,6 +90,7 @@ class HistoryConfig:
     connections: Scope | None
     chats: Scope | None
     correction_window_seconds: int = DEFAULT_CORRECTION_WINDOW_SECONDS
+    nearby_before_seconds: int = DEFAULT_NEARBY_BEFORE_SECONDS
     retention_days: int = DEFAULT_RETENTION_DAYS
     max_bytes: int = DEFAULT_MAX_BYTES
 
@@ -286,6 +289,7 @@ def _parse_scope(raw: str | None) -> Scope | None:
 
 def history_config_from_env() -> HistoryConfig:
     correction_window = max(1, _env_int(HISTORY_CORRECTION_WINDOW_ENV, DEFAULT_CORRECTION_WINDOW_SECONDS))
+    nearby_before_seconds = max(0, _env_int(HISTORY_NEARBY_BEFORE_SECONDS_ENV, DEFAULT_NEARBY_BEFORE_SECONDS))
     retention_days = max(0, _env_int(HISTORY_RETENTION_DAYS_ENV, DEFAULT_RETENTION_DAYS))
     max_bytes = max(1, _env_int(HISTORY_MAX_BYTES_ENV, DEFAULT_MAX_BYTES))
     return HistoryConfig(
@@ -293,6 +297,7 @@ def history_config_from_env() -> HistoryConfig:
         connections=_parse_scope(os.environ.get(HISTORY_CONNECTIONS_ENV)),
         chats=_parse_scope(os.environ.get(HISTORY_CHATS_ENV)),
         correction_window_seconds=correction_window,
+        nearby_before_seconds=nearby_before_seconds,
         retention_days=retention_days,
         max_bytes=max_bytes,
     )
@@ -533,6 +538,28 @@ def _event_id(record: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _legacy_replay_event_id(record: dict[str, Any]) -> str | None:
+    event_id = str(record.get("event_id") or "")
+    if not event_id:
+        return None
+    raw_direction = str(record.get("direction") or "").strip().casefold()
+    if raw_direction == "incoming":
+        canonical_direction = "inbound"
+    elif raw_direction == "outgoing":
+        canonical_direction = "outbound"
+    else:
+        return None
+    try:
+        replay_record = dict(record)
+        replay_record["direction"] = canonical_direction
+        replay_event_id = _event_id(replay_record)
+    except KeyError:
+        return None
+    if replay_event_id == event_id:
+        return None
+    return replay_event_id
+
+
 def _build_event(
     *,
     event_type: str,
@@ -571,7 +598,7 @@ def _build_event(
         "message_id": message_id,
         "message_at": _isoformat_utc(_normalize_timestamp(message_at) if not isinstance(message_at, str) else _parse_datetime(message_at)),
         "sender_id": sender_id,
-        "direction": direction or "unknown",
+        "direction": _normalize_history_direction(direction),
         "reply_to_message_id": reply_to_message_id,
     }
     if text is not None:
@@ -620,6 +647,9 @@ def _apply_record_to_state(state: ChatState, record: dict[str, Any]) -> None:
     event_id = str(record.get("event_id") or "")
     if event_id:
         state.seen_event_ids.add(event_id)
+        legacy_replay_event_id = _legacy_replay_event_id(record)
+        if legacy_replay_event_id is not None:
+            state.seen_event_ids.add(legacy_replay_event_id)
     state.record_count += 1
     event_type = str(record.get("event_type") or "")
     message_key = str(record.get("message_id"))
@@ -628,7 +658,7 @@ def _apply_record_to_state(state: ChatState, record: dict[str, Any]) -> None:
         state.messages[message_key] = MessageState(
             message_id=record.get("message_id"),
             sender_id=record.get("sender_id"),
-            direction=str(record.get("direction") or "unknown"),
+            direction=_normalize_history_direction(record.get("direction")),
             text=record.get("text"),
             message_at=record.get("message_at"),
             reply_to_message_id=record.get("reply_to_message_id"),
@@ -688,6 +718,15 @@ def _normalize_compare_text(text: str | None) -> str:
     return compact
 
 
+def _normalize_history_direction(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"outbound", "outgoing", "sent"}:
+        return "outbound"
+    if normalized in {"inbound", "incoming", "received"}:
+        return "inbound"
+    return "unknown"
+
+
 def _similarity_score(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right, autojunk=False).ratio()
 
@@ -698,6 +737,7 @@ def _classify_one_deletion(
     pending: PendingDeletion,
     now: datetime,
     correction_window_seconds: int,
+    nearby_before_seconds: int,
 ) -> dict[str, Any] | None:
     if pending.classification is not None:
         return None
@@ -720,7 +760,7 @@ def _classify_one_deletion(
             message_id=deleted_event.get("message_id"),
             message_at=deleted_event.get("message_at"),
             sender_id=deleted_event.get("sender_id"),
-            direction=str(deleted_event.get("direction") or "unknown"),
+            direction=_normalize_history_direction(deleted_event.get("direction")),
             reply_to_message_id=deleted_event.get("reply_to_message_id"),
             deleted_event_id=deleted_event["event_id"],
             classification="unclassifiable",
@@ -741,7 +781,7 @@ def _classify_one_deletion(
             message_id=deleted_event.get("message_id"),
             message_at=deleted_event.get("message_at"),
             sender_id=deleted_event.get("sender_id"),
-            direction=str(deleted_event.get("direction") or "unknown"),
+            direction=_normalize_history_direction(deleted_event.get("direction")),
             reply_to_message_id=deleted_event.get("reply_to_message_id"),
             deleted_event_id=deleted_event["event_id"],
             classification="unclassifiable",
@@ -750,6 +790,7 @@ def _classify_one_deletion(
             deleted_observed_at=deleted_at,
         )
 
+    candidate_earliest = deleted_at - timedelta(seconds=nearby_before_seconds)
     candidate_deadline = deleted_at + timedelta(seconds=correction_window_seconds)
     nearby_candidates: list[tuple[float, MessageState]] = []
     for candidate in chat_state.messages.values():
@@ -763,7 +804,7 @@ def _classify_one_deletion(
             continue
         if candidate.text is None or candidate.last_observed_at is None:
             continue
-        if candidate.last_observed_at < deleted_at or candidate.last_observed_at > candidate_deadline:
+        if candidate.last_observed_at < candidate_earliest or candidate.last_observed_at > candidate_deadline:
             continue
         delta = (candidate.last_observed_at - deleted_at).total_seconds()
         nearby_candidates.append((delta, candidate))
@@ -789,7 +830,7 @@ def _classify_one_deletion(
                 message_id=deleted_event.get("message_id"),
                 message_at=deleted_event.get("message_at"),
                 sender_id=deleted_event.get("sender_id"),
-                direction=str(deleted_event.get("direction") or "unknown"),
+                direction=_normalize_history_direction(deleted_event.get("direction")),
                 reply_to_message_id=deleted_event.get("reply_to_message_id"),
                 deleted_event_id=deleted_event["event_id"],
                 classification="likely_duplicate",
@@ -823,7 +864,7 @@ def _classify_one_deletion(
                 message_id=deleted_event.get("message_id"),
                 message_at=deleted_event.get("message_at"),
                 sender_id=deleted_event.get("sender_id"),
-                direction=str(deleted_event.get("direction") or "unknown"),
+                direction=_normalize_history_direction(deleted_event.get("direction")),
                 reply_to_message_id=deleted_event.get("reply_to_message_id"),
                 deleted_event_id=deleted_event["event_id"],
                 classification="likely_correction",
@@ -844,7 +885,7 @@ def _classify_one_deletion(
         message_id=deleted_event.get("message_id"),
         message_at=deleted_event.get("message_at"),
         sender_id=deleted_event.get("sender_id"),
-        direction=str(deleted_event.get("direction") or "unknown"),
+        direction=_normalize_history_direction(deleted_event.get("direction")),
         reply_to_message_id=deleted_event.get("reply_to_message_id"),
         deleted_event_id=deleted_event["event_id"],
         classification="unexplained",
@@ -935,6 +976,7 @@ def _sync_pending_deletions_for_chat(
             pending=pending,
             now=now,
             correction_window_seconds=config.correction_window_seconds,
+            nearby_before_seconds=config.nearby_before_seconds,
         )
         if record is None or record["event_id"] in state.seen_event_ids:
             continue
@@ -1168,7 +1210,7 @@ async def _maybe_await(value: Any) -> Any:
 
 async def _resolve_direction(message: Any, *, bot: Any = None) -> str:
     if _get(message, "sender_business_bot") is not None:
-        return "outgoing"
+        return "outbound"
     business_connection_id = _get(message, "business_connection_id") or _get(message, "_hermes_business_connection_id")
     from_user_id = _get(_get(message, "from_user"), "id")
     if not business_connection_id or from_user_id is None or bot is None:
@@ -1188,7 +1230,7 @@ async def _resolve_direction(message: Any, *, bot: Any = None) -> str:
             return "unknown"
         owner_id = str(owner)
         _OWNER_CACHE[connection_key] = owner_id
-    return "outgoing" if owner_id == str(from_user_id) else "incoming"
+    return "outbound" if owner_id == str(from_user_id) else "inbound"
 
 
 def _extract_history_text(message: Any) -> str | None:
@@ -1395,7 +1437,7 @@ def _history_text_line(record: dict[str, Any]) -> str:
     message_id = record.get("message_id")
     event_type = record.get("event_type")
     source = record.get("source")
-    direction = record.get("direction")
+    direction = _normalize_history_direction(record.get("direction"))
     sender_id = record.get("sender_id")
     text = record.get("text")
     if text is not None:
@@ -1524,6 +1566,7 @@ def handle_cli(args: argparse.Namespace) -> int:
                     f"connections={config.connections.render() if config.connections else '<unset>'}",
                     f"chats={config.chats.render() if config.chats else '<unset>'}",
                     f"correction_window={config.correction_window_seconds}s",
+                    f"nearby_before={config.nearby_before_seconds}s",
                     f"retention_days={config.retention_days}",
                     f"max_bytes={config.max_bytes}",
                     f"chat_count={stats.chat_count}",

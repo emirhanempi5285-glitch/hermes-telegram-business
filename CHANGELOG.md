@@ -11,6 +11,7 @@
 - Keep long and emoji-heavy transcripts complete with UTF-16-safe chunking, and align caption/reply fallback by retrying the selected surface as plain text when Telegram rejects expandable entities.
 - Add opt-in raw, no-agent Telegram Business text history captured from blocking PTB Business update observation.
 - Persist immutable delete tombstones plus source-tagged `deletion.classified` records with canonical `classification_reason` codes.
+- Align history schema v1 direction values to `inbound|outbound|unknown` and classify nearby delete candidates across the 15-second pre-window plus the existing post-delete correction window.
 - Keep history storage and CLI bounded with streamed JSONL scans, closed-partition pruning, and terminal-safe text rendering.
 - Fix the raw Business observer path so Hermes startup handling with `Update.ALL_TYPES` also records deleted Business updates.
 

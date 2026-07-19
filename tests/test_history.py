@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -181,6 +182,84 @@ def load_history_file(plugin, *, business_id: str = "business-123", chat_id: int
     raise AssertionError("history file not found")
 
 
+def make_legacy_history_record(
+    plugin,
+    *,
+    event_type: str,
+    source: str,
+    observed_at: datetime,
+    telegram_update_id: int,
+    business_connection_id: str = "business-123",
+    chat_id: int = 991,
+    message_id: int = 77,
+    message_at: datetime | None = None,
+    sender_id: int | None = 2000,
+    direction: str,
+    reply_to_message_id: int | None = None,
+    text: str | None = None,
+    deleted_event_id: str | None = None,
+    classification: str | None = None,
+    replacement_message_id: int | None = None,
+    classification_reason: str | None = None,
+    classification_score: float | None = None,
+    evaluated_at: datetime | None = None,
+    deleted_observed_at: datetime | None = None,
+):
+    history = plugin._history_support
+    record = {
+        "schema_version": history.SCHEMA_VERSION,
+        "event_type": event_type,
+        "source": source,
+        "observed_at": history._isoformat_utc(observed_at),
+        "telegram_update_id": telegram_update_id,
+        "business_connection_id": str(business_connection_id),
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "message_at": history._isoformat_utc(message_at),
+        "sender_id": sender_id,
+        "direction": direction,
+        "reply_to_message_id": reply_to_message_id,
+    }
+    if text is not None:
+        record["text"] = text
+    if deleted_event_id is not None:
+        record["deleted_event_id"] = deleted_event_id
+    if classification is not None:
+        record["classification"] = classification
+    if replacement_message_id is not None:
+        record["replacement_message_id"] = replacement_message_id
+    if classification_reason is not None:
+        record["classification_reason"] = classification_reason
+        record["classification_method"] = classification_reason
+    if classification_score is not None:
+        record["classification_score"] = round(float(classification_score), 4)
+    if evaluated_at is not None:
+        record["evaluated_at"] = history._isoformat_utc(evaluated_at)
+    if deleted_observed_at is not None:
+        record["deleted_observed_at"] = history._isoformat_utc(deleted_observed_at)
+    payload = json.dumps(
+        history._record_signature(record),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    record["event_id"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return record
+
+
+def append_raw_history_records(plugin, *records: dict[str, Any]) -> None:
+    history = plugin._history_support
+    for record in records:
+        observed_at = history._parse_datetime(record.get("observed_at"))
+        assert observed_at is not None
+        chat_dir = history._history_chat_dir(record["business_connection_id"], record["chat_id"])
+        path = chat_dir / history._month_filename(observed_at)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 class TimerHarness:
     class FakeTimer:
         def __init__(self, registry: list["TimerHarness.FakeTimer"], interval: float, function, args=None, kwargs=None):
@@ -255,13 +334,16 @@ async def test_history_scope_supports_exact_and_wildcard(
     assert found is matches
 
 
-def test_history_config_defaults_disable_retention_and_parse_zero(plugin, monkeypatch: pytest.MonkeyPatch):
+def test_history_config_defaults_and_env_overrides(plugin, monkeypatch: pytest.MonkeyPatch):
     config = plugin._history_support.history_config_from_env()
+    assert config.nearby_before_seconds == 15
     assert config.retention_days == 0
     assert config.max_bytes == 1024 * 1024 * 1024
 
+    monkeypatch.setenv("HERMES_TELEGRAM_BUSINESS_HISTORY_NEARBY_BEFORE_SECONDS", "7")
     monkeypatch.setenv("HERMES_TELEGRAM_BUSINESS_HISTORY_RETENTION_DAYS", "0")
     config = plugin._history_support.history_config_from_env()
+    assert config.nearby_before_seconds == 7
     assert config.retention_days == 0
 
 
@@ -551,6 +633,11 @@ async def test_direction_resolution_accepts_sender_business_bot_and_owner_lookup
         bot=FakeBot(owner_id=1000),
         now=base + timedelta(seconds=1),
     )
+    await plugin._history_support.observe_ptb_update(
+        make_business_text_update(text="customer", message_id=80, update_id=4, date=base, from_user_id=2000),
+        bot=FakeBot(owner_id=1000),
+        now=base + timedelta(seconds=2),
+    )
     unknown_bot = FakeBot(owner_id=1000)
     unknown_bot.lookup_error = RuntimeError("lookup failed")
     await plugin._history_support.observe_ptb_update(
@@ -563,14 +650,167 @@ async def test_direction_resolution_accepts_sender_business_bot_and_owner_lookup
             business_id="business-999",
         ),
         bot=unknown_bot,
-        now=base + timedelta(seconds=2),
+        now=base + timedelta(seconds=3),
     )
 
     directions = {record["message_id"]: record["direction"] for record in load_records(plugin)}
-    assert directions[77] == "outgoing"
-    assert directions[78] == "outgoing"
+    assert directions[77] == "outbound"
+    assert directions[78] == "outbound"
+    assert directions[80] == "inbound"
     unknown_records = load_records(plugin, business_id="business-999", chat_id=991)
     assert unknown_records[-1]["direction"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "edited"),
+    [
+        ("message.created", False),
+        ("message.edited", True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("legacy_direction", "canonical_direction", "from_user_id", "owner_id"),
+    [
+        ("incoming", "inbound", 2000, 1000),
+        ("outgoing", "outbound", 1000, 1000),
+    ],
+)
+async def test_reload_deduplicates_legacy_message_retries_after_direction_rename(
+    enabled_history,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    edited: bool,
+    legacy_direction: str,
+    canonical_direction: str,
+    from_user_id: int,
+    owner_id: int,
+):
+    plugin = enabled_history
+    base = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)
+    source = "edited_business_message" if edited else "business_message"
+    legacy_record = make_legacy_history_record(
+        plugin,
+        event_type=event_type,
+        source=source,
+        observed_at=base,
+        telegram_update_id=42,
+        message_at=base,
+        sender_id=from_user_id,
+        direction=legacy_direction,
+        text="legacy retry",
+    )
+    canonical_record = dict(legacy_record)
+    canonical_record["direction"] = canonical_direction
+    canonical_event_id = plugin._history_support._event_id(canonical_record)
+
+    assert canonical_event_id != legacy_record["event_id"]
+
+    append_raw_history_records(plugin, legacy_record)
+    reloaded = _load_plugin_module(monkeypatch, plugin._history_support.history_root().parents[2])
+    chat_dir = reloaded._history_support._history_chat_dir("business-123", 991)
+    state, _ = reloaded._history_support._load_chat_state(chat_dir)
+
+    assert legacy_record["event_id"] in state.seen_event_ids
+    assert canonical_event_id in state.seen_event_ids
+    assert state.messages["77"].direction == canonical_direction
+
+    wrote = await reloaded._history_support.observe_ptb_update(
+        make_business_text_update(
+            text="legacy retry",
+            message_id=77,
+            update_id=42,
+            date=base,
+            from_user_id=from_user_id,
+            edited=edited,
+        ),
+        bot=FakeBot(owner_id=owner_id),
+        now=base + timedelta(seconds=30),
+    )
+
+    assert wrote is False
+    records = load_records(reloaded)
+    assert len(records) == 1
+    assert records[0]["event_id"] == legacy_record["event_id"]
+    assert records[0]["direction"] == legacy_direction
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy_direction", "canonical_direction", "from_user_id", "owner_id"),
+    [
+        ("incoming", "inbound", 2000, 1000),
+        ("outgoing", "outbound", 1000, 1000),
+    ],
+)
+async def test_reload_deduplicates_legacy_delete_retry_and_classifies_with_canonical_direction(
+    enabled_history,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_direction: str,
+    canonical_direction: str,
+    from_user_id: int,
+    owner_id: int,
+):
+    plugin = enabled_history
+    base = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)
+    created_record = make_legacy_history_record(
+        plugin,
+        event_type="message.created",
+        source="business_message",
+        observed_at=base,
+        telegram_update_id=41,
+        message_at=base,
+        sender_id=from_user_id,
+        direction=legacy_direction,
+        text="legacy delete retry",
+    )
+    deleted_record = make_legacy_history_record(
+        plugin,
+        event_type="message.deleted",
+        source="deleted_business_messages",
+        observed_at=base + timedelta(seconds=1),
+        telegram_update_id=42,
+        message_at=base,
+        sender_id=from_user_id,
+        direction=legacy_direction,
+    )
+
+    append_raw_history_records(plugin, created_record, deleted_record)
+    reloaded = _load_plugin_module(monkeypatch, plugin._history_support.history_root().parents[2])
+    chat_dir = reloaded._history_support._history_chat_dir("business-123", 991)
+    state, _ = reloaded._history_support._load_chat_state(chat_dir)
+    canonical_deleted = dict(deleted_record)
+    canonical_deleted["direction"] = canonical_direction
+    canonical_deleted_event_id = reloaded._history_support._event_id(canonical_deleted)
+
+    assert canonical_deleted_event_id in state.seen_event_ids
+    assert deleted_record["event_id"] in state.pending_deletions
+
+    wrote = await reloaded._history_support.observe_ptb_update(
+        make_deleted_update(message_ids=(77,), update_id=42),
+        bot=FakeBot(owner_id=owner_id),
+        now=base + timedelta(seconds=5),
+    )
+
+    assert wrote is False
+    assert len(load_records(reloaded)) == 2
+
+    result = reloaded._history_support.maintain_history(now=base + timedelta(seconds=20))
+    records = load_records(reloaded)
+    classification = records[-1]
+
+    assert result.classified == 1
+    assert len(records) == 3
+    assert deleted_record["direction"] == legacy_direction
+    assert classification["event_type"] == "deletion.classified"
+    assert classification["classification"] == "unexplained"
+    assert classification["classification_reason"] == "no_strong_match"
+    assert classification["direction"] == canonical_direction
+    assert classification["deleted_event_id"] == deleted_record["event_id"]
+
+    second_result = reloaded._history_support.maintain_history(now=base + timedelta(seconds=21))
+    assert second_result.classified == 0
+    assert len(load_records(reloaded)) == 3
 
 
 async def _delete_and_classify(
@@ -665,7 +905,7 @@ async def test_deleted_message_without_original_is_unclassifiable(plugin, monkey
 
 
 @pytest.mark.asyncio
-async def test_identical_pre_delete_message_is_not_classified_as_replacement(enabled_history):
+async def test_identical_pre_delete_message_within_nearby_before_window_is_likely_duplicate(enabled_history):
     plugin = enabled_history
     base = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)
     bot = FakeBot()
@@ -678,14 +918,44 @@ async def test_identical_pre_delete_message_is_not_classified_as_replacement(ena
     await plugin._history_support.observe_ptb_update(
         make_business_text_update(text="same text", message_id=88, update_id=2, date=base),
         bot=bot,
-        now=base + timedelta(seconds=2),
+        now=base + timedelta(seconds=5),
     )
     await plugin._history_support.observe_ptb_update(
         make_deleted_update(message_ids=(77,), update_id=3),
         bot=bot,
-        now=base + timedelta(seconds=5),
+        now=base + timedelta(seconds=10),
     )
-    plugin._history_support.maintain_history(now=base + timedelta(seconds=20))
+    plugin._history_support.maintain_history(now=base + timedelta(seconds=30))
+
+    classifications = [record for record in load_records(plugin) if record["event_type"] == "deletion.classified"]
+
+    assert classifications[-1]["classification"] == "likely_duplicate"
+    assert classifications[-1]["classification_reason"] == "normalized_exact_duplicate"
+    assert classifications[-1]["replacement_message_id"] == 88
+
+
+@pytest.mark.asyncio
+async def test_identical_pre_delete_message_outside_nearby_before_window_is_unexplained(enabled_history):
+    plugin = enabled_history
+    base = datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc)
+    bot = FakeBot()
+
+    await plugin._history_support.observe_ptb_update(
+        make_business_text_update(text="same text", message_id=77, update_id=1, date=base),
+        bot=bot,
+        now=base,
+    )
+    await plugin._history_support.observe_ptb_update(
+        make_business_text_update(text="same text", message_id=88, update_id=2, date=base),
+        bot=bot,
+        now=base + timedelta(seconds=1),
+    )
+    await plugin._history_support.observe_ptb_update(
+        make_deleted_update(message_ids=(77,), update_id=3),
+        bot=bot,
+        now=base + timedelta(seconds=17),
+    )
+    plugin._history_support.maintain_history(now=base + timedelta(seconds=30))
 
     classifications = [record for record in load_records(plugin) if record["event_type"] == "deletion.classified"]
 
@@ -945,6 +1215,12 @@ async def test_history_cli_show_search_export_deletions_and_verify(enabled_histo
     plugin._history_support.maintain_history(now=base + timedelta(seconds=20))
 
     parser = _build_history_parser(plugin)
+
+    exit_code = plugin._history_support.handle_cli(parser.parse_args(["history", "stats"]))
+    output = capsys.readouterr().out.strip()
+    assert exit_code == 0
+    assert "correction_window=10s" in output
+    assert "nearby_before=15s" in output
 
     exit_code = plugin._history_support.handle_cli(parser.parse_args(["history", "show", "--chat", "991", "--limit", "1"]))
     output = capsys.readouterr().out.strip().splitlines()

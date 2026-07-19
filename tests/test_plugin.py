@@ -225,6 +225,7 @@ def test_readme_uses_public_name_and_canonical_install_source():
     assert "hermes plugins install neoromantic/hermes-telegram-business --enable" in readme
     assert "legacy-stable" in readme
     assert "HERMES_TELEGRAM_BUSINESS_HISTORY_ENABLE" in readme
+    assert "HERMES_TELEGRAM_BUSINESS_HISTORY_NEARBY_BEFORE_SECONDS" in readme
     assert "hermes telegram-business history show" in readme
     assert "Update.ALL_TYPES" in readme
     assert "PTB 22.6" in readme
@@ -233,6 +234,11 @@ def test_readme_uses_public_name_and_canonical_install_source():
     assert "`classification_reason`" in readme
     assert "`0` disables retention pruning" in readme
     assert "`1073741824`" in readme
+    assert "no transcript/history database is created" not in readme
+    assert "The voice module creates no separate transcript database" in readme
+    assert "only persistent text store" in readme
+    assert "no record-level or right-to-erasure command" in readme
+    assert "preserves it and surfaces the shortfall explicitly" in readme
 
 
 def test_history_skill_documents_runtime_scheduler_and_defaults():
@@ -244,9 +250,12 @@ def test_history_skill_documents_runtime_scheduler_and_defaults():
     assert "Update.ALL_TYPES" in skill
     assert "`source`" in skill
     assert "`classification_reason`" in skill
+    assert "HERMES_TELEGRAM_BUSINESS_HISTORY_NEARBY_BEFORE_SECONDS" in skill
     assert "default `0`" in skill
     assert "1073741824" in skill
     assert "does not depend on `maintain`" in skill
+    assert "No record-level or right-to-erasure command ships in v1." in skill
+    assert "active month is preserved" in skill
 
 
 def test_ci_runs_on_main_and_version_tags():
