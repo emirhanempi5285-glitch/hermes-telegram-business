@@ -9,6 +9,8 @@
 - Preserve existing caption text and entities, and fall back to Business-scoped replies for incoming, long, expired, uncertain, or uneditable messages.
 - Render transcript caption blocks and reply chunks with native `expandable_blockquote` entities using UTF-16 offsets.
 - Keep long and emoji-heavy transcripts complete with UTF-16-safe chunking, and align caption/reply fallback by retrying the selected surface as plain text when Telegram rejects expandable entities.
+- Register `hermes telegram-business` for profile-local Business targets and one-attempt static Business sends without an agent turn or retry ledger.
+- Document script-only Hermes cron usage with `--quiet`, explicit failure delivery, and Telegram's lack of send idempotency keys.
 
 ## 0.6.1 - 2026-07-18
 

@@ -22,6 +22,57 @@ Handled updates are identified from stable Telegram Business connection, chat, u
 
 The broader product direction includes operator or CRM integration adapters and opt-in automation modules. The small event/module boundary is now implemented; those product integrations are still planned extension points, not implemented features in `0.6.1`.
 
+## Deterministic outbound Business sends
+
+The plugin also registers a stable script-facing CLI command for static Telegram Business sends without an agent turn:
+
+```bash
+hermes telegram-business target add ops \
+  --business-connection-id "$TELEGRAM_BUSINESS_CONNECTION_ID" \
+  --chat-id "$TELEGRAM_BUSINESS_CHAT_ID"
+
+hermes telegram-business target list
+hermes telegram-business target remove ops
+
+hermes telegram-business send --target ops --text-file ./message.txt
+hermes telegram-business send --target ops --text-file ./message.txt --reply-to-message-id 12345
+```
+
+Targets are stored in one profile-local JSON file under the active Hermes home. The file contains only target aliases, Business connection IDs, and chat IDs; message bodies are not stored or logged by this send path. Adding a target fails if the alias already exists, so remove and re-add when you intend to replace a target.
+
+On target creation and every send, the CLI asks Telegram for the Business connection and requires that it is enabled and grants `can_reply`. It never guesses recipients and never falls back to ordinary bot sends. A successful send prints a compact JSON audit event with the target alias, delivery timestamp, Business connection ID, chat ID, Telegram message ID, optional reply ID, and status. The audit output never includes message text.
+
+For no-agent scripts, use `--quiet` so success stdout is empty and cron only sees failures:
+
+```bash
+install -d ~/.hermes/scripts
+
+cat > ~/.hermes/scripts/send-business-reminder.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+printf 'Daily static Business reminder\n' > "$tmp"
+
+hermes telegram-business send --target ops --text-file "$tmp" --quiet
+EOF
+
+chmod +x ~/.hermes/scripts/send-business-reminder.sh
+```
+
+Schedule that script with Hermes cron and include an explicit failure/lifecycle delivery target:
+
+```bash
+hermes cron create "0 9 * * 1-5" \
+  --name telegram-business-reminder \
+  --script ~/.hermes/scripts/send-business-reminder.sh \
+  --no-agent \
+  --deliver telegram:123456789
+```
+
+This path is intentionally ledger-free. Telegram Bot API sends do not have an idempotency key, so an ambiguous timeout may already have delivered the message. Do not blindly retry unless your script content and downstream process tolerate duplicates.
+
 ## Requirements
 
 - Hermes Agent with plugin hooks, `pre_gateway_dispatch`, and `ctx.llm` support (current Hermes releases).

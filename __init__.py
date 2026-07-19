@@ -1458,3 +1458,14 @@ def register(ctx: Any) -> None:
     _llm_facade = getattr(ctx, "llm", None)
     _install_telegram_adapter_compat()
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    if hasattr(ctx, "register_cli_command"):
+        from .telegram_business_outbound import register_cli as _register_telegram_business_cli
+        from .telegram_business_outbound import telegram_business_command as _telegram_business_command
+
+        ctx.register_cli_command(
+            name="telegram-business",
+            help="Telegram Business target management and deterministic sends",
+            setup_fn=_register_telegram_business_cli,
+            handler_fn=_telegram_business_command,
+            description="Manage profile-local Telegram Business targets and send static text without an agent turn.",
+        )

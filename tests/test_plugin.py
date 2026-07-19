@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
+import importlib
 import importlib.util
+import json
 import sys
 import tomllib
 import types
@@ -40,13 +43,26 @@ def _load_plugin_module(
         monkeypatch.setitem(sys.modules, "telegram", telegram)
         monkeypatch.setitem(sys.modules, "telegram.error", telegram_error)
 
-    module_name = f"telegram_business_voice_transcriber_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_FILE)
+    monkeypatch.delitem(sys.modules, "telegram_business_outbound", raising=False)
+    filtered_sys_path = [entry for entry in sys.path if Path(entry or ".").resolve() != ROOT]
+    monkeypatch.setattr(sys, "path", filtered_sys_path)
+
+    hermes_plugins = types.ModuleType("hermes_plugins")
+    hermes_plugins.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_plugins", hermes_plugins)
+
+    module_name = f"hermes_plugins.telegram_business_voice_transcriber_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_FILE, submodule_search_locations=[str(ROOT)])
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_outbound_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    plugin = _load_plugin_module(monkeypatch, tmp_path)
+    return importlib.import_module(f"{plugin.__name__}.telegram_business_outbound")
 
 
 @pytest.fixture
@@ -223,6 +239,17 @@ def test_readme_uses_public_name_and_canonical_install_source():
     assert readme.startswith("# Hermes Telegram Business\n")
     assert f"{CANONICAL_REPOSITORY}/actions/workflows/test.yml" in readme
     assert "hermes plugins install neoromantic/hermes-telegram-business --enable" in readme
+    assert 'hermes cron create "0 9 * * 1-5" \\' in readme
+    assert "--name telegram-business-reminder" in readme
+    assert "--script ~/.hermes/scripts/send-business-reminder.sh" in readme
+    assert "--no-agent" in readme
+    assert "idempotency key" in readme
+    assert "ambiguous timeout" in readme
+    assert '"Static Telegram Business reminder"' not in readme
+    assert "placeholder string" not in readme
+    assert "The current Hermes CLI still takes the positional prompt argument" not in readme
+    assert "hermes cron add" not in readme
+    assert "prevents overlapping duplicate ticks" not in readme
     assert "legacy-stable" in readme
     assert "not implemented" in readme
 
@@ -275,18 +302,245 @@ def test_optional_telegram_error_names_are_import_safe(monkeypatch: pytest.Monke
     ) is compat_plugin.CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE
 
 
-def test_registers_only_pre_gateway_dispatch_hook(plugin):
+def test_registers_pre_gateway_dispatch_hook_and_cli_command(plugin):
     llm = object()
-    registrations = []
+    hook_registrations = []
+    cli_registrations = []
     ctx = SimpleNamespace(
         llm=llm,
-        register_hook=lambda name, callback: registrations.append((name, callback)),
+        register_hook=lambda name, callback: hook_registrations.append((name, callback)),
+        register_cli_command=lambda **kwargs: cli_registrations.append(kwargs),
     )
 
     plugin.register(ctx)
 
     assert plugin._llm_facade is llm
-    assert registrations == [("pre_gateway_dispatch", plugin._on_pre_gateway_dispatch)]
+    assert hook_registrations == [("pre_gateway_dispatch", plugin._on_pre_gateway_dispatch)]
+    assert len(cli_registrations) == 1
+    assert cli_registrations[0]["name"] == "telegram-business"
+    assert cli_registrations[0]["setup_fn"].__module__ == f"{plugin.__name__}.telegram_business_outbound"
+    assert cli_registrations[0]["handler_fn"].__module__ == f"{plugin.__name__}.telegram_business_outbound"
+
+
+class FakeBusinessSendClient:
+    def __init__(self, *, is_enabled: bool = True, can_reply: bool = True, send_error: Exception | None = None):
+        self.is_enabled = is_enabled
+        self.can_reply = can_reply
+        self.send_error = send_error
+        self.connection_calls: list[str] = []
+        self.send_calls: list[dict] = []
+
+    async def get_business_connection(self, *, business_connection_id: str):
+        self.connection_calls.append(business_connection_id)
+        return SimpleNamespace(
+            is_enabled=self.is_enabled,
+            rights=SimpleNamespace(can_reply=self.can_reply),
+        )
+
+    async def send_message(self, **kwargs):
+        self.send_calls.append(kwargs)
+        if self.send_error is not None:
+            raise self.send_error
+        return SimpleNamespace(message_id=987)
+
+
+@pytest.fixture
+def outbound(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    return _load_outbound_module(monkeypatch, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_outbound_targets_are_profile_local_and_support_add_list_remove(monkeypatch, tmp_path):
+    first = _load_outbound_module(monkeypatch, tmp_path / "first")
+    second = _load_outbound_module(monkeypatch, tmp_path / "second")
+    client = FakeBusinessSendClient()
+
+    target = await first.add_target(
+        "ops",
+        business_connection_id="biz-1",
+        chat_id="chat-1",
+        client=client,
+    )
+
+    assert target.alias == "ops"
+    assert client.connection_calls == ["biz-1"]
+    assert first.list_targets() == [target]
+    assert second.list_targets() == []
+    with pytest.raises(first.TelegramBusinessCliError, match="already exists"):
+        await first.add_target(
+            "ops",
+            business_connection_id="biz-2",
+            chat_id="chat-2",
+            client=client,
+        )
+    assert first.remove_target("ops") == target
+    assert first.list_targets() == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_add_and_send_require_enabled_connection_with_can_reply(outbound):
+    with pytest.raises(outbound.TelegramBusinessCliError, match="disabled"):
+        await outbound.add_target(
+            "disabled",
+            business_connection_id="biz-disabled",
+            chat_id="chat",
+            client=FakeBusinessSendClient(is_enabled=False),
+        )
+    with pytest.raises(outbound.TelegramBusinessCliError, match="can_reply"):
+        await outbound.add_target(
+            "readonly",
+            business_connection_id="biz-readonly",
+            chat_id="chat",
+            client=FakeBusinessSendClient(can_reply=False),
+        )
+    await outbound.add_target("ops", business_connection_id="biz-1", chat_id="chat-1", client=FakeBusinessSendClient())
+    with pytest.raises(outbound.TelegramBusinessCliError, match="disabled"):
+        await outbound.send_target("ops", text="body", client=FakeBusinessSendClient(is_enabled=False))
+    with pytest.raises(outbound.TelegramBusinessCliError, match="can_reply"):
+        await outbound.send_target("ops", text="body", client=FakeBusinessSendClient(can_reply=False))
+
+
+@pytest.mark.asyncio
+async def test_outbound_send_uses_one_attempt_with_int_reply_id_and_redacted_audit(outbound):
+    client = FakeBusinessSendClient()
+    await outbound.add_target("ops", business_connection_id="biz-1", chat_id="chat-1", client=client)
+
+    def fixed_now():
+        return datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc)
+
+    audit = await outbound.send_target(
+        "ops",
+        text="secret body",
+        reply_to_message_id=123,
+        client=client,
+        now=fixed_now,
+    )
+
+    assert client.connection_calls == ["biz-1", "biz-1"]
+    assert len(client.send_calls) == 1
+    assert client.send_calls == [
+        {
+            "business_connection_id": "biz-1",
+            "chat_id": "chat-1",
+            "text": "secret body",
+            "reply_to_message_id": 123,
+        }
+    ]
+    assert audit == {
+        "target_alias": "ops",
+        "delivered_at": "2026-07-19T12:30:00Z",
+        "business_connection_id": "biz-1",
+        "chat_id": "chat-1",
+        "telegram_message_id": 987,
+        "reply_to_message_id": 123,
+        "status": "sent",
+    }
+    assert "secret body" not in json.dumps(audit)
+
+
+def test_outbound_cli_parser_parses_int_reply_id(outbound):
+    parser = argparse.ArgumentParser()
+    outbound.register_cli(parser)
+
+    args = parser.parse_args(
+        [
+            "send",
+            "--target",
+            "ops",
+            "--text-file",
+            "body.txt",
+            "--reply-to-message-id",
+            "123",
+            "--quiet",
+        ]
+    )
+
+    assert args.telegram_business_action == "send"
+    assert args.func is outbound.telegram_business_command
+    assert args.reply_to_message_id == 123
+    assert args.quiet is True
+
+
+def test_outbound_cli_success_quiet_and_failure_output(outbound, monkeypatch, tmp_path, capsys):
+    client = FakeBusinessSendClient()
+    text_file = tmp_path / "message.txt"
+    text_file.write_text("secret body", encoding="utf-8")
+
+    async def seed():
+        await outbound.add_target("ops", business_connection_id="biz-1", chat_id="chat-1", client=client)
+
+    asyncio.run(seed())
+    monkeypatch.setattr(outbound, "_client_from_profile", lambda: client)
+    args = argparse.Namespace(
+        telegram_business_action="send",
+        target="ops",
+        text_file=str(text_file),
+        reply_to_message_id=123,
+        quiet=False,
+    )
+
+    assert outbound.telegram_business_command(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "secret body" not in captured.out
+    assert json.loads(captured.out)["reply_to_message_id"] == 123
+
+    quiet_args = argparse.Namespace(
+        telegram_business_action="send",
+        target="ops",
+        text_file=str(text_file),
+        reply_to_message_id=None,
+        quiet=True,
+    )
+
+    assert outbound.telegram_business_command(quiet_args) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+    failing_client = FakeBusinessSendClient(send_error=RuntimeError("boom"))
+    monkeypatch.setattr(outbound, "_client_from_profile", lambda: failing_client)
+    with pytest.raises(SystemExit) as excinfo:
+        outbound.telegram_business_command(args)
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Telegram Business send failed: boom" in captured.err
+
+
+def test_outbound_cli_parsed_handler_raises_nonzero_exit_status(outbound, monkeypatch, tmp_path):
+    client = FakeBusinessSendClient()
+    text_file = tmp_path / "message.txt"
+    text_file.write_text("secret body", encoding="utf-8")
+
+    async def seed():
+        await outbound.add_target("ops", business_connection_id="biz-1", chat_id="chat-1", client=client)
+
+    asyncio.run(seed())
+    parser = argparse.ArgumentParser()
+    outbound.register_cli(parser)
+    failing_client = FakeBusinessSendClient(send_error=RuntimeError("boom"))
+    monkeypatch.setattr(outbound, "_client_from_profile", lambda: failing_client)
+    args = parser.parse_args(["send", "--target", "ops", "--text-file", str(text_file)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        args.func(args)
+
+    assert excinfo.value.code == 1
+
+
+def test_outbound_cli_missing_action_exits_2(outbound, capsys):
+    parser = argparse.ArgumentParser()
+    outbound.register_cli(parser)
+    args = parser.parse_args([])
+
+    with pytest.raises(SystemExit) as excinfo:
+        outbound.telegram_business_command(args)
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no action selected" in captured.err
 
 
 def _install_fake_telegram_adapter(monkeypatch: pytest.MonkeyPatch):
