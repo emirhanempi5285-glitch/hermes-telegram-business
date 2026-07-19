@@ -37,6 +37,39 @@ except ModuleNotFoundError as exc:
         configured = os.getenv("HERMES_HOME")
         return Path(configured).expanduser() if configured else Path.home() / ".hermes"
 
+def _optional_telegram_error_type(module: Any, name: str) -> type[BaseException] | None:
+    value = getattr(module, name, None)
+    return value if isinstance(value, type) and issubclass(value, BaseException) else None
+
+
+try:
+    import telegram.error as _telegram_error
+except ModuleNotFoundError:
+    _PTB_DEFINITE_CAPTION_EDIT_REJECTION_TYPES: tuple[type[BaseException], ...] = ()
+    _PTB_UNCERTAIN_CAPTION_EDIT_TYPES: tuple[type[BaseException], ...] = ()
+else:
+    _PTB_DEFINITE_CAPTION_EDIT_REJECTION_TYPES = tuple(
+        exc_type
+        for exc_type in (
+            _optional_telegram_error_type(_telegram_error, "BadRequest"),
+            _optional_telegram_error_type(_telegram_error, "Forbidden"),
+            _optional_telegram_error_type(_telegram_error, "InvalidToken"),
+            _optional_telegram_error_type(_telegram_error, "RetryAfter"),
+            _optional_telegram_error_type(_telegram_error, "ChatMigrated"),
+            _optional_telegram_error_type(_telegram_error, "Conflict"),
+            _optional_telegram_error_type(_telegram_error, "EndPointNotFound"),
+        )
+        if exc_type is not None
+    )
+    _PTB_UNCERTAIN_CAPTION_EDIT_TYPES = tuple(
+        exc_type
+        for exc_type in (
+            _optional_telegram_error_type(_telegram_error, "TimedOut"),
+            _optional_telegram_error_type(_telegram_error, "NetworkError"),
+        )
+        if exc_type is not None
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +144,19 @@ class TelegramBusinessEvent:
 class ModuleBehavior(str, Enum):
     PASS_THROUGH = "pass_through"
     HANDLED = "handled"
+
+
+class CaptionEditAttemptOutcome(str, Enum):
+    APPLIED = "applied"
+    UNSUPPORTED_ENTITY = "unsupported_entity"
+    DEFINITE_REJECTION = "definite_rejection"
+    UNCERTAIN_REMOTE_STATE = "uncertain_remote_state"
+
+
+class TranscriptCaptionOutcome(str, Enum):
+    ATTACHED = "attached"
+    REPLY_FALLBACK = "reply_fallback"
+    REMOTE_STATE_UNCERTAIN = "remote_state_uncertain"
 
 
 @dataclass(frozen=True)
@@ -205,6 +251,39 @@ Hard rules:
 - Return only the proofread transcript body in the JSON `text` field.
 - Return strict JSON matching the schema.
 """
+
+_DEFINITE_CAPTION_EDIT_REJECTION_CLASS_NAMES = frozenset(
+    {
+        "BadRequest",
+        "Forbidden",
+        "InvalidToken",
+        "RetryAfter",
+        "ChatMigrated",
+        "Conflict",
+        "EndPointNotFound",
+    }
+)
+
+_UNCERTAIN_CAPTION_EDIT_CLASS_NAMES = frozenset(
+    {
+        "TimedOut",
+        "NetworkError",
+    }
+)
+
+_CAPTION_EDIT_ALREADY_APPLIED_MARKERS = (
+    "message is not modified",
+)
+
+_DEFINITE_CAPTION_EDIT_REJECTION_MARKERS = (
+    "message can't be edited",
+    "message can not be edited",
+    "message to edit not found",
+    "there is no caption in the message to edit",
+    "chat not found",
+    "have no rights to send",
+    "not enough rights",
+)
 
 
 def _truthy_env(name: str) -> bool:
@@ -719,38 +798,48 @@ async def _download_voice(message: Any, path: Path) -> Path:
     return path
 
 
+def _telegram_text_length(text: str) -> int:
+    """Return Telegram's UTF-16 code-unit length for a text field."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _utf16_prefix_index(text: str, limit: int) -> int:
+    """Return the largest Python string index that fits a UTF-16 budget."""
+    units = 0
+    for index, char in enumerate(text):
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if units + char_units > limit:
+            return index
+        units += char_units
+    return len(text)
+
+
 def _split_text(text: str, limit: int = _MAX_CHUNK_CHARS) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
-    if len(text) <= limit:
+    if _telegram_text_length(text) <= limit:
         return [text]
 
     chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for paragraph in re.split(r"(\n+)", text):
-        if not paragraph:
-            continue
-        if current_len + len(paragraph) <= limit:
-            current.append(paragraph)
-            current_len += len(paragraph)
-            continue
-        if current:
-            chunks.append("".join(current).strip())
-            current = []
-            current_len = 0
-        while len(paragraph) > limit:
-            cut = paragraph.rfind(" ", 0, limit)
-            if cut < limit // 2:
-                cut = limit
-            chunks.append(paragraph[:cut].strip())
-            paragraph = paragraph[cut:].lstrip()
-        if paragraph:
-            current = [paragraph]
-            current_len = len(paragraph)
-    if current:
-        chunks.append("".join(current).strip())
+    remaining = text
+    while _telegram_text_length(remaining) > limit:
+        hard_cut = _utf16_prefix_index(remaining, limit)
+        if hard_cut <= 0:
+            raise ValueError("text chunk limit is too small for one Unicode character")
+
+        newline_cut = remaining.rfind("\n", 0, hard_cut + 1)
+        space_cut = remaining.rfind(" ", 0, hard_cut + 1)
+        natural_cut = max(newline_cut, space_cut)
+        cut = natural_cut + 1 if natural_cut >= hard_cut // 2 else hard_cut
+        chunk = remaining[:cut].strip()
+        if not chunk:
+            cut = hard_cut
+            chunk = remaining[:cut]
+        chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
     return [c for c in chunks if c]
 
 
@@ -764,11 +853,6 @@ def _format_transcript_messages(transcript: str) -> list[str]:
     return messages
 
 
-def _telegram_text_length(text: str) -> int:
-    """Return Telegram's UTF-16 code-unit length for a text field."""
-    return len((text or "").encode("utf-16-le")) // 2
-
-
 def _build_transcript_caption(message: Any, transcript: str) -> Optional[str]:
     """Build a plain short-transcript caption without truncating either text."""
     transcript = (transcript or "").strip()
@@ -780,6 +864,35 @@ def _build_transcript_caption(message: Any, transcript: str) -> Optional[str]:
     if _telegram_text_length(caption) > _MAX_CAPTION_CHARS:
         return None
     return caption
+
+
+def _expandable_blockquote_entity(text: str, *, offset: int = 0) -> dict[str, Any]:
+    """Build a Telegram expandable-blockquote entity with UTF-16 positions."""
+    return {
+        "type": "expandable_blockquote",
+        "offset": offset,
+        "length": _telegram_text_length(text),
+    }
+
+
+def _build_transcript_caption_payload(
+    message: Any,
+    transcript: str,
+) -> Optional[tuple[str, tuple[Any, ...]]]:
+    """Build a fitting caption plus an entity that collapses the transcript block."""
+    caption = _build_transcript_caption(message, transcript)
+    if caption is None:
+        return None
+
+    transcript_block = f"🎙️ {(transcript or '').strip()}"
+    existing_caption = _get(message, "caption")
+    prefix = f"{existing_caption}\n\n" if existing_caption else ""
+    existing_entities = tuple(_get(message, "caption_entities") or ())
+    transcript_entity = _expandable_blockquote_entity(
+        transcript_block,
+        offset=_telegram_text_length(prefix),
+    )
+    return caption, (*existing_entities, transcript_entity)
 
 
 def _within_business_edit_window(message: Any, *, now: Optional[datetime] = None) -> bool:
@@ -816,37 +929,120 @@ async def _is_outgoing_business_message(*, bot: Any, message: Any) -> bool:
     return owner_id is not None and str(owner_id) == str(from_user_id)
 
 
-async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: str) -> bool:
-    """Attach a fitting outgoing transcript, returning False for safe reply fallback."""
-    caption = _build_transcript_caption(message, transcript)
-    if caption is None or not _within_business_edit_window(message):
-        return False
+def _caption_edit_error_detail(exc: Exception) -> str:
+    return str(exc).casefold().replace("’", "'")
+
+
+def _caption_edit_already_applied(exc: Exception) -> bool:
+    return any(marker in _caption_edit_error_detail(exc) for marker in _CAPTION_EDIT_ALREADY_APPLIED_MARKERS)
+
+
+def _definite_caption_edit_rejection(exc: Exception) -> bool:
+    """Return True only for positively identified Telegram-side edit rejections."""
+    if _PTB_DEFINITE_CAPTION_EDIT_REJECTION_TYPES and isinstance(exc, _PTB_DEFINITE_CAPTION_EDIT_REJECTION_TYPES):
+        return True
+    if exc.__class__.__name__ in _DEFINITE_CAPTION_EDIT_REJECTION_CLASS_NAMES:
+        return True
+    detail = _caption_edit_error_detail(exc)
+    return any(marker in detail for marker in _DEFINITE_CAPTION_EDIT_REJECTION_MARKERS)
+
+
+def _uncertain_caption_edit_remote_state(exc: Exception) -> bool:
+    if _PTB_UNCERTAIN_CAPTION_EDIT_TYPES and isinstance(exc, _PTB_UNCERTAIN_CAPTION_EDIT_TYPES):
+        return True
+    return exc.__class__.__name__ in _UNCERTAIN_CAPTION_EDIT_CLASS_NAMES
+
+
+def _classify_caption_edit_exception(exc: Exception) -> CaptionEditAttemptOutcome:
+    if _caption_edit_already_applied(exc):
+        return CaptionEditAttemptOutcome.APPLIED
+    if _expandable_entity_unsupported(exc):
+        return CaptionEditAttemptOutcome.UNSUPPORTED_ENTITY
+    if _definite_caption_edit_rejection(exc):
+        return CaptionEditAttemptOutcome.DEFINITE_REJECTION
+    if _uncertain_caption_edit_remote_state(exc):
+        return CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE
+    return CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE
+
+
+def _classify_caption_edit_result(result: Any) -> CaptionEditAttemptOutcome:
+    return CaptionEditAttemptOutcome.APPLIED if result is not False else CaptionEditAttemptOutcome.DEFINITE_REJECTION
+
+
+def _log_uncertain_caption_edit(*, message: Any, stage: str, exc: Exception) -> None:
+    chat_id = _safe_part(_get(_get(message, "chat"), "id", ""))
+    message_id = _safe_part(_get(message, "message_id", ""))
+    logger.warning(
+        "%s: %s for chat=%s message=%s; suppressing reply fallback (%s)",
+        _PLUGIN_NAME,
+        stage,
+        chat_id,
+        message_id,
+        exc.__class__.__name__,
+    )
+
+
+async def _try_attach_transcript_caption(*, bot: Any, message: Any, transcript: str) -> TranscriptCaptionOutcome:
+    """Attach a fitting outgoing transcript, or classify the safe fallback outcome."""
+    payload = _build_transcript_caption_payload(message, transcript)
+    if payload is None or not _within_business_edit_window(message):
+        return TranscriptCaptionOutcome.REPLY_FALLBACK
+    caption, caption_entities = payload
     if not await _is_outgoing_business_message(bot=bot, message=message):
-        return False
+        return TranscriptCaptionOutcome.REPLY_FALLBACK
 
     chat_id = _get(_get(message, "chat"), "id")
     message_id = _get(message, "message_id")
     business_connection_id = _business_connection_id(message)
     if chat_id is None or message_id is None or not business_connection_id:
-        return False
+        return TranscriptCaptionOutcome.REPLY_FALLBACK
 
     kwargs = {
         "chat_id": chat_id,
         "message_id": message_id,
         "caption": caption,
+        "caption_entities": caption_entities,
         "business_connection_id": business_connection_id,
     }
-    caption_entities = _get(message, "caption_entities")
-    if caption_entities:
-        # Existing entity offsets remain valid because the old caption is kept
-        # byte-for-byte at the start and the transcript is appended as plain text.
-        kwargs["caption_entities"] = caption_entities
     try:
         result = await bot.edit_message_caption(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - Telegram edit failures must preserve delivery
-        logger.info("%s: caption edit unavailable; using transcript reply: %s", _PLUGIN_NAME, exc)
-        return False
-    return result is not False
+    except Exception as exc:  # noqa: BLE001 - edit failures need explicit duplicate-safe classification
+        outcome = _classify_caption_edit_exception(exc)
+        if outcome is CaptionEditAttemptOutcome.APPLIED:
+            return TranscriptCaptionOutcome.ATTACHED
+        if outcome is CaptionEditAttemptOutcome.DEFINITE_REJECTION:
+            logger.info("%s: caption edit rejected; using transcript reply: %s", _PLUGIN_NAME, exc)
+            return TranscriptCaptionOutcome.REPLY_FALLBACK
+        if outcome is CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE:
+            _log_uncertain_caption_edit(message=message, stage="caption edit outcome uncertain", exc=exc)
+            return TranscriptCaptionOutcome.REMOTE_STATE_UNCERTAIN
+
+        logger.info("%s: expandable caption unavailable; retrying plain caption: %s", _PLUGIN_NAME, exc)
+        plain_kwargs = {
+            **kwargs,
+            "caption_entities": tuple(_get(message, "caption_entities") or ()),
+        }
+        try:
+            result = await bot.edit_message_caption(**plain_kwargs)
+        except Exception as fallback_exc:  # noqa: BLE001 - only definite rejection may fall back to reply
+            fallback_outcome = _classify_caption_edit_exception(fallback_exc)
+            if fallback_outcome is CaptionEditAttemptOutcome.APPLIED:
+                return TranscriptCaptionOutcome.ATTACHED
+            if fallback_outcome is CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE:
+                _log_uncertain_caption_edit(
+                    message=message,
+                    stage="plain caption retry outcome uncertain",
+                    exc=fallback_exc,
+                )
+                return TranscriptCaptionOutcome.REMOTE_STATE_UNCERTAIN
+            logger.info("%s: plain caption retry rejected; using transcript reply: %s", _PLUGIN_NAME, fallback_exc)
+            return TranscriptCaptionOutcome.REPLY_FALLBACK
+
+    return (
+        TranscriptCaptionOutcome.ATTACHED
+        if _classify_caption_edit_result(result) is CaptionEditAttemptOutcome.APPLIED
+        else TranscriptCaptionOutcome.REPLY_FALLBACK
+    )
 
 
 def _sanitize_llm_text(text: str) -> str:
@@ -1009,12 +1205,21 @@ def _get_adapter_and_bot(event: Any, gateway: Any) -> tuple[Any, Any]:
     return adapter, bot
 
 
+def _expandable_entity_unsupported(exc: Exception) -> bool:
+    """Identify entity-capability failures that are safe to retry as plain text."""
+    detail = str(exc).casefold().replace("’", "'")
+    return "expandable_blockquote" in detail and any(
+        marker in detail for marker in ("unsupported", "not supported", "unknown", "entity type")
+    )
+
+
 async def _send_transcript_messages(
     *,
     bot: Any,
     adapter: Any,
     message: Any,
     texts: Iterable[str],
+    collapsible: bool = True,
 ) -> None:
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     business_connection_id = _business_connection_id(message)
@@ -1031,9 +1236,18 @@ async def _send_transcript_messages(
             "business_connection_id": business_connection_id,
             **notify_kwargs,
         }
+        if collapsible:
+            kwargs["entities"] = (_expandable_blockquote_entity(text),)
         if first and reply_to_message_id is not None:
             kwargs["reply_to_message_id"] = reply_to_message_id
-        await bot.send_message(**kwargs)
+        try:
+            await bot.send_message(**kwargs)
+        except Exception as exc:
+            if not collapsible or not _expandable_entity_unsupported(exc):
+                raise
+            logger.info("%s: expandable transcript unavailable; using plain text: %s", _PLUGIN_NAME, exc)
+            fallback_kwargs = {key: value for key, value in kwargs.items() if key != "entities"}
+            await bot.send_message(**fallback_kwargs)
         first = False
 
 
@@ -1047,6 +1261,7 @@ async def _send_error_if_enabled(*, bot: Any, adapter: Any, message: Any, error:
             adapter=adapter,
             message=message,
             texts=[f"🎙️ Не смог распознать голосовое/видеокружок: {safe_error}"],
+            collapsible=False,
         )
     except Exception as exc:  # noqa: BLE001 - best-effort diagnostic path
         logger.debug("%s: failed to send STT error notice: %s", _PLUGIN_NAME, exc)
@@ -1093,12 +1308,12 @@ async def _process_business_voice_event(
             return
 
         final_text = await _cleanup_transcript(transcript, llm=llm, cleanup_fn=cleanup_fn)
-        captioned = await _try_attach_transcript_caption(bot=bot, message=message, transcript=final_text)
-        if not captioned:
+        caption_outcome = await _try_attach_transcript_caption(bot=bot, message=message, transcript=final_text)
+        if caption_outcome is TranscriptCaptionOutcome.REPLY_FALLBACK:
             texts = _format_transcript_messages(final_text)
             await _send_transcript_messages(bot=bot, adapter=adapter, message=message, texts=texts)
         logger.info(
-            "%s: transcribed business %s chat=%s message=%s raw_chars=%d final_chars=%d cleaned=%s captioned=%s",
+            "%s: transcribed business %s chat=%s message=%s raw_chars=%d final_chars=%d cleaned=%s caption_outcome=%s",
             _PLUGIN_NAME,
             media_label,
             _safe_part(getattr(getattr(message, "chat", None), "id", "")),
@@ -1106,7 +1321,7 @@ async def _process_business_voice_event(
             len(transcript),
             len(final_text),
             final_text != transcript,
-            captioned,
+            caption_outcome.value,
         )
     except Exception as exc:  # noqa: BLE001 - hook task must never kill gateway
         logger.warning("%s: business voice handling failed: %s", _PLUGIN_NAME, exc, exc_info=True)

@@ -13,10 +13,10 @@ An extensible [Hermes Agent](https://github.com/NousResearch/hermes-agent) integ
 4. Downloads the media transiently and delegates speech recognition to Hermes's configured `transcribe_audio` backend.
 5. Optionally asks the host-owned `ctx.llm` facade to correct punctuation, capitalization, paragraphing, and obvious ASR errors.
 6. Rejects lossy cleanup or model failure and falls back to the raw transcript.
-7. For a short outgoing Business message, appends the transcript to the original voice/video-note caption.
-8. Uses the existing Business-scoped reply path for incoming, long, expired, or uneditable messages.
+7. For a short outgoing Business message, appends the transcript to the original voice/video-note caption as an expandable blockquote, retrying the same caption as plain text when Telegram rejects the new entity type.
+8. Uses expandable Business-scoped replies for incoming, long, expired, or uneditable messages, with the equivalent plain-text retry.
 
-Handled updates are identified from stable Telegram Business connection, chat, update/message, and relationship data, then suppressed in memory for 24 hours. A successful caption edit suppresses the separate transcript reply, so the chat never receives both forms. The plugin never runs a separate model provider client and never needs its own credentials.
+Handled updates are identified from stable Telegram Business connection, chat, update/message, and relationship data, then suppressed in memory for 24 hours. A successful caption edit suppresses the separate transcript reply, so the chat never receives both forms. PTB `BadRequest` is treated as a definite Telegram-side rejection unless it is the recognized `message is not modified` or unsupported-entity case. Failed entity requests are not treated as delivered before their targeted plain-text retry, and ambiguous post-send transport/backend failures suppress the reply fallback unless remote state is verified. The plugin never runs a separate model provider client and never needs its own credentials.
 
 ## Roadmap
 
@@ -126,13 +126,13 @@ Telegram gateway event
   -> Hermes transcribe_audio (configured host STT)
   -> optional ctx.llm structured cleanup
   -> lexical conservatism guard / raw fallback
-  -> short outgoing message: edit_message_caption(..., business_connection_id=...)
-  -> otherwise: send_message(..., business_connection_id=...)
+  -> short outgoing message: edit_message_caption(..., caption_entities=[expandable], business_connection_id=...)
+  -> otherwise: send_message(..., entities=[expandable], business_connection_id=...)
 ```
 
-Outgoing direction is checked against the owner returned by Telegram's `getBusinessConnection`; `sender_business_bot` is also accepted as an explicit outgoing signal. Caption text is plain text and limited conservatively to Telegram's 1024 UTF-16 code-unit ceiling. An existing caption is retained unchanged at the start, including its entities, then separated from the transcript by a blank line.
+Outgoing direction is checked against the owner returned by Telegram's `getBusinessConnection`; `sender_business_bot` is also accepted as an explicit outgoing signal. Caption text is plain text and limited conservatively to Telegram's 1024 UTF-16 code-unit ceiling. An existing caption is retained unchanged at the start, including its entities, then separated from the transcript by a blank line. A UTF-16-positioned `expandable_blockquote` entity covers only the appended transcript block.
 
-Incoming messages, transcripts that do not fit in one caption, messages outside Telegram's 48-hour Business edit window, uncertain direction, and any caption-edit API failure use the existing reply path. The first response chunk replies to the original message; continuation chunks use the same Business connection.
+Incoming messages, transcripts that do not fit in one caption, messages outside Telegram's 48-hour Business edit window, uncertain direction, and definite caption-edit rejection, including generic PTB `BadRequest`, use the existing reply path. The first response chunk replies to the original message; continuation chunks use the same Business connection. Caption and reply surfaces follow the same capability policy: use `expandable_blockquote` first, then retry the selected surface once as plain text only after a recognized unsupported-entity rejection. Ambiguous caption-edit transport/backend failures after Telegram may already have seen the request suppress the separate reply instead of risking duplicate transcript delivery.
 
 ## Privacy and security
 
@@ -154,7 +154,8 @@ Incoming messages, transcripts that do not fit in one caption, messages outside 
 - STT failure sends nothing unless error replies are enabled.
 - Empty STT output sends nothing.
 - Cleanup timeout, trust denial, malformed output, excessive deletion/addition, or broad paraphrasing falls back to raw STT text.
-- Caption direction checks, length checks, edit-window checks, and API failures fall back to a separate transcript reply.
+- Caption direction checks, length checks, edit-window checks, and definite caption-edit rejections fall back to a separate expandable transcript reply.
+- A recognized unsupported-entity response retries the selected caption or reply surface once without the new entity; PTB `BadRequest` counts as a definite caption rejection unless it is the recognized not-modified or unsupported-entity case, while `TimedOut`, other `NetworkError` failures, and unrelated exceptions suppress the reply fallback to avoid duplicates.
 - A successful caption edit never also sends a transcript reply.
 
 ## Testing

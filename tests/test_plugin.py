@@ -20,11 +20,25 @@ CANONICAL_REPOSITORY = "https://github.com/neoromantic/hermes-telegram-business"
 LEGACY_PLUGIN_ID = "telegram-business-voice-transcriber"
 
 
-@pytest.fixture
-def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def _load_plugin_module(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    telegram_error_attrs: dict[str, object] | None = None,
+):
     hermes_constants = types.ModuleType("hermes_constants")
     hermes_constants.get_hermes_home = lambda: tmp_path
     monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+
+    if telegram_error_attrs is not None:
+        telegram = types.ModuleType("telegram")
+        telegram.__path__ = []
+        telegram_error = types.ModuleType("telegram.error")
+        for name, value in telegram_error_attrs.items():
+            setattr(telegram_error, name, value)
+        telegram.error = telegram_error
+        monkeypatch.setitem(sys.modules, "telegram", telegram)
+        monkeypatch.setitem(sys.modules, "telegram.error", telegram_error)
 
     module_name = f"telegram_business_voice_transcriber_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, PLUGIN_FILE)
@@ -33,6 +47,11 @@ def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture
+def plugin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    return _load_plugin_module(monkeypatch, tmp_path)
 
 
 class Platform:
@@ -60,14 +79,24 @@ class FakeMedia:
 class FakeBot:
     def __init__(self, *, business_owner_id: int = 1000):
         self.calls: list[dict] = []
+        self.delivered_calls: list[dict] = []
         self.edit_calls: list[dict] = []
         self.business_connection_calls: list[str] = []
         self.business_owner_id = business_owner_id
         self.business_connection_error: Exception | None = None
         self.edit_error: Exception | None = None
+        self.edit_side_effects: list[object] = []
+        self.edit_result = True
+        self.expandable_entities_unsupported = False
+        self.send_error: Exception | None = None
 
     async def send_message(self, **kwargs):
         self.calls.append(kwargs)
+        if self.expandable_entities_unsupported and _has_expandable_entity(kwargs.get("entities", ())):
+            raise RuntimeError("unsupported message entity type: expandable_blockquote")
+        if self.send_error is not None:
+            raise self.send_error
+        self.delivered_calls.append(kwargs)
 
     async def get_business_connection(self, business_connection_id: str):
         self.business_connection_calls.append(business_connection_id)
@@ -77,9 +106,28 @@ class FakeBot:
 
     async def edit_message_caption(self, **kwargs):
         self.edit_calls.append(kwargs)
+        if self.edit_side_effects:
+            effect = self.edit_side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
+            return effect
+        if self.expandable_entities_unsupported and _has_expandable_entity(kwargs.get("caption_entities", ())):
+            raise RuntimeError("unsupported message entity type: expandable_blockquote")
         if self.edit_error is not None:
             raise self.edit_error
-        return True
+        return self.edit_result
+
+
+class NetworkError(RuntimeError):
+    pass
+
+
+class TimedOut(NetworkError):
+    pass
+
+
+class BadRequest(NetworkError):
+    pass
 
 
 class FakeAdapter:
@@ -88,6 +136,16 @@ class FakeAdapter:
 
     def _notification_kwargs(self, _message):
         return {"disable_notification": True}
+
+
+def _entity_fields(entity):
+    if isinstance(entity, dict):
+        return entity["type"], entity["offset"], entity["length"]
+    return entity.type, entity.offset, entity.length
+
+
+def _has_expandable_entity(entities) -> bool:
+    return any(_entity_fields(entity)[0] == "expandable_blockquote" for entity in entities)
 
 
 def make_message(
@@ -186,6 +244,35 @@ def test_runtime_identity_and_configuration_namespace_remain_legacy_stable(plugi
     assert plugin._PLUGIN_NAME == LEGACY_PLUGIN_ID
     assert plugin._DISABLE_ENV == "TG_BUSINESS_VOICE_TRANSCRIBER_DISABLE"
     assert plugin._SEND_ERRORS_ENV == "TG_BUSINESS_VOICE_TRANSCRIBER_SEND_ERRORS"
+
+
+def test_optional_telegram_error_names_are_import_safe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class CompatNetworkError(RuntimeError):
+        pass
+
+    class CompatTimedOut(CompatNetworkError):
+        pass
+
+    class CompatBadRequest(CompatNetworkError):
+        pass
+
+    compat_plugin = _load_plugin_module(
+        monkeypatch,
+        tmp_path,
+        telegram_error_attrs={
+            "BadRequest": CompatBadRequest,
+            "TimedOut": CompatTimedOut,
+            "NetworkError": CompatNetworkError,
+            "Forbidden": type("CompatForbidden", (RuntimeError,), {}),
+        },
+    )
+
+    assert compat_plugin._classify_caption_edit_exception(
+        CompatBadRequest("malformed request payload")
+    ) is compat_plugin.CaptionEditAttemptOutcome.DEFINITE_REJECTION
+    assert compat_plugin._classify_caption_edit_exception(
+        CompatTimedOut("timed out")
+    ) is compat_plugin.CaptionEditAttemptOutcome.UNCERTAIN_REMOTE_STATE
 
 
 def test_registers_only_pre_gateway_dispatch_hook(plugin):
@@ -783,6 +870,13 @@ async def test_end_to_end_processing_delegates_stt_replies_and_deletes_media(
         {
             "chat_id": 991,
             "text": "🎙️ Это тестовая расшифровка",
+            "entities": (
+                {
+                    "type": "expandable_blockquote",
+                    "offset": 0,
+                    "length": plugin._telegram_text_length("🎙️ Это тестовая расшифровка"),
+                },
+            ),
             "business_connection_id": "business-123",
             "disable_notification": True,
             "reply_to_message_id": 77,
@@ -820,7 +914,10 @@ async def test_short_outgoing_transcript_edits_original_caption_without_duplicat
             "chat_id": 991,
             "message_id": 77,
             "caption": "Existing\n\n🎙️ Short transcript",
-            "caption_entities": (existing_entity,),
+            "caption_entities": (
+                existing_entity,
+                {"type": "expandable_blockquote", "offset": 10, "length": 20},
+            ),
             "business_connection_id": "business-123",
         }
     ]
@@ -837,8 +934,21 @@ def test_caption_fit_uses_telegram_utf16_limit_and_existing_caption(plugin):
     assert plugin._telegram_text_length("🎙️") == 3
 
 
+def test_expandable_caption_entity_offsets_and_lengths_use_utf16(plugin):
+    existing_entity = {"type": "bold", "offset": 0, "length": 2}
+    message = make_message(caption="🙂", caption_entities=(existing_entity,))
+
+    payload = plugin._build_transcript_caption_payload(message, "🙂 done")
+
+    assert payload is not None
+    caption, entities = payload
+    assert caption == "🙂\n\n🎙️ 🙂 done"
+    assert entities[0] is existing_entity
+    assert _entity_fields(entities[1]) == ("expandable_blockquote", 4, 11)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["expired", "api", "owner_lookup"])
+@pytest.mark.parametrize("failure", ["expired", "api", "api_false", "owner_lookup"])
 async def test_uneditable_outgoing_transcript_falls_back_to_separate_reply(
     plugin, monkeypatch: pytest.MonkeyPatch, failure: str
 ):
@@ -850,6 +960,8 @@ async def test_uneditable_outgoing_transcript_falls_back_to_separate_reply(
     bot = FakeBot(business_owner_id=1000)
     if failure == "api":
         bot.edit_error = RuntimeError("message can't be edited")
+    elif failure == "api_false":
+        bot.edit_result = False
     elif failure == "owner_lookup":
         bot.business_connection_error = RuntimeError("connection lookup unavailable")
     gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
@@ -864,6 +976,13 @@ async def test_uneditable_outgoing_transcript_falls_back_to_separate_reply(
         {
             "chat_id": 991,
             "text": "🎙️ Fallback transcript",
+            "entities": (
+                {
+                    "type": "expandable_blockquote",
+                    "offset": 0,
+                    "length": plugin._telegram_text_length("🎙️ Fallback transcript"),
+                },
+            ),
             "business_connection_id": "business-123",
             "disable_notification": True,
             "reply_to_message_id": 77,
@@ -872,7 +991,7 @@ async def test_uneditable_outgoing_transcript_falls_back_to_separate_reply(
     if failure == "expired":
         assert bot.business_connection_calls == []
         assert bot.edit_calls == []
-    elif failure == "api":
+    elif failure in {"api", "api_false"}:
         assert len(bot.edit_calls) == 1
     else:
         assert bot.edit_calls == []
@@ -898,6 +1017,296 @@ async def test_over_caption_limit_transcript_skips_direction_lookup_and_uses_rep
     assert bot.business_connection_calls == []
     assert bot.edit_calls == []
     assert bot.calls[0]["text"] == f"🎙️ {transcript}"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expandable_caption_retries_plain_caption_without_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    existing_entity = SimpleNamespace(type="bold", offset=0, length=8)
+    message = make_message(
+        from_user_id=1000,
+        caption="Existing",
+        caption_entities=(existing_entity,),
+    )
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption"] == "Existing\n\n🎙️ Fallback transcript"
+    assert bot.edit_calls[1]["caption_entities"] == (existing_entity,)
+    assert bot.calls == []
+
+
+@pytest.mark.asyncio
+async def test_message_not_modified_on_first_caption_edit_does_not_send_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_error = BadRequest("Message is not modified")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Already attached transcript"},
+    )
+
+    assert bot.business_connection_calls == ["business-123"]
+    assert len(bot.edit_calls) == 1
+    assert bot.calls == []
+    assert bot.delivered_calls == []
+
+
+@pytest.mark.asyncio
+async def test_generic_bad_request_caption_edit_exception_uses_reply_fallback(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_error = BadRequest("malformed request payload")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert bot.business_connection_calls == ["business-123"]
+    assert len(bot.edit_calls) == 1
+    assert bot.delivered_calls == [bot.calls[0]]
+    assert bot.calls[0]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_generic_runtime_error_caption_edit_exception_does_not_send_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_error = RuntimeError("backend exploded")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Ambiguous transcript"},
+    )
+
+    assert bot.business_connection_calls == ["business-123"]
+    assert len(bot.edit_calls) == 1
+    assert bot.calls == []
+    assert bot.delivered_calls == []
+    assert "caption edit outcome uncertain" in caplog.text
+    assert "suppressing reply fallback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_timed_out_caption_edit_exception_does_not_send_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_error = TimedOut("timed out")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Timed out transcript"},
+    )
+
+    assert bot.business_connection_calls == ["business-123"]
+    assert len(bot.edit_calls) == 1
+    assert bot.calls == []
+    assert bot.delivered_calls == []
+    assert "caption edit outcome uncertain" in caplog.text
+    assert "suppressing reply fallback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_message_not_modified_on_plain_caption_retry_does_not_send_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    bot.edit_error = BadRequest("Message is not modified")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Ambiguous transcript"},
+    )
+
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption_entities"] == ()
+    assert bot.calls == []
+    assert bot.delivered_calls == []
+
+
+@pytest.mark.asyncio
+async def test_network_error_on_plain_caption_retry_does_not_send_reply(
+    plugin, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_side_effects = [
+        RuntimeError("unsupported message entity type: expandable_blockquote"),
+        NetworkError("upstream reset"),
+    ]
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Network transcript"},
+    )
+
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption_entities"] == ()
+    assert bot.calls == []
+    assert bot.delivered_calls == []
+    assert "plain caption retry outcome uncertain" in caplog.text
+    assert "suppressing reply fallback" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_definite_caption_rejection_still_uses_reply_fallback(
+    plugin, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.edit_error = RuntimeError("message can't be edited")
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert len(bot.edit_calls) == 1
+    assert bot.delivered_calls == [bot.calls[0]]
+    assert bot.calls[0]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expandable_reply_retries_plain_once(plugin, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message()
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert bot.edit_calls == []
+    assert len(bot.calls) == 2
+    assert _has_expandable_entity(bot.calls[0]["entities"])
+    assert "entities" not in bot.calls[1]
+    assert bot.delivered_calls == [bot.calls[1]]
+    assert bot.calls[1]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_failed_plain_caption_retry_uses_complete_plain_reply(plugin, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TG_BUSINESS_VOICE_CLEANUP_DISABLE", "1")
+    message = make_message(from_user_id=1000)
+    event = make_event(message)
+    bot = FakeBot(business_owner_id=1000)
+    bot.expandable_entities_unsupported = True
+    bot.edit_result = False
+    gateway = SimpleNamespace(adapters={event.source.platform: FakeAdapter(bot)})
+
+    await plugin._process_business_voice_event(
+        event=event,
+        gateway=gateway,
+        transcribe_fn=lambda _path: {"success": True, "transcript": "Fallback transcript"},
+    )
+
+    assert len(bot.edit_calls) == 2
+    assert _has_expandable_entity(bot.edit_calls[0]["caption_entities"])
+    assert bot.edit_calls[1]["caption_entities"] == ()
+    assert len(bot.calls) == 2
+    assert _has_expandable_entity(bot.calls[0]["entities"])
+    assert "entities" not in bot.calls[1]
+    assert bot.delivered_calls == [bot.calls[1]]
+    assert bot.calls[1]["text"] == "🎙️ Fallback transcript"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_expandable_entities_preserve_every_long_transcript_chunk(plugin):
+    transcript = "🙂" * 5000
+    texts = plugin._format_transcript_messages(transcript)
+    bot = FakeBot()
+    bot.expandable_entities_unsupported = True
+
+    await plugin._send_transcript_messages(
+        bot=bot,
+        adapter=FakeAdapter(bot),
+        message=make_message(),
+        texts=texts,
+    )
+
+    assert len(bot.calls) == len(texts) * 2
+    assert bot.delivered_calls == bot.calls[1::2]
+    assert all("entities" not in call for call in bot.delivered_calls)
+    assert bot.delivered_calls[0]["reply_to_message_id"] == 77
+    assert all("reply_to_message_id" not in call for call in bot.delivered_calls[1:])
+    assert "".join(call["text"].removeprefix("🎙️ ") for call in bot.delivered_calls) == transcript
+
+
+@pytest.mark.asyncio
+async def test_unrelated_entity_send_error_is_not_retried_as_plain_text(plugin):
+    bot = FakeBot()
+    bot.send_error = RuntimeError("Bad Request: can't parse entities: malformed offset")
+
+    with pytest.raises(RuntimeError, match="malformed offset"):
+        await plugin._send_transcript_messages(
+            bot=bot,
+            adapter=FakeAdapter(bot),
+            message=make_message(),
+            texts=["🎙️ Transcript"],
+        )
+
+    assert len(bot.calls) == 1
+    assert _has_expandable_entity(bot.calls[0]["entities"])
+    assert bot.delivered_calls == []
 
 
 @pytest.mark.asyncio
@@ -1041,8 +1450,18 @@ def test_long_transcript_is_split_into_telegram_safe_messages(plugin):
 
     assert len(messages) >= 3
     assert messages[0].startswith("🎙️ ")
-    assert all(len(message) <= plugin._MAX_CHUNK_CHARS + 2 for message in messages)
+    assert all(plugin._telegram_text_length(message) <= plugin._MAX_CHUNK_CHARS + 4 for message in messages)
     assert all(not message.startswith("🎙️ ") for message in messages[1:])
+    assert sum(message.count("word") for message in messages) == 2200
+    assert messages[0].startswith("🎙️ first paragraph")
+
+
+def test_emoji_heavy_transcript_chunks_stay_within_utf16_budget(plugin):
+    messages = plugin._format_transcript_messages("🙂" * 5000)
+
+    assert len(messages) >= 3
+    assert all(plugin._telegram_text_length(message) <= plugin._MAX_CHUNK_CHARS + 4 for message in messages)
+    assert "".join(message.removeprefix("🎙️ ") for message in messages) == "🙂" * 5000
 
 
 @pytest.mark.asyncio
@@ -1062,3 +1481,7 @@ async def test_only_first_chunk_replies_to_original_message(plugin):
     assert bot.calls[0]["reply_to_message_id"] == 77
     assert "reply_to_message_id" not in bot.calls[1]
     assert all(call["disable_notification"] is True for call in bot.calls)
+    assert [_entity_fields(call["entities"][0]) for call in bot.calls] == [
+        ("expandable_blockquote", 0, 5),
+        ("expandable_blockquote", 0, 6),
+    ]
